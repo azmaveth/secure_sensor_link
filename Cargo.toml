@@ -2,6 +2,8 @@
 name = "secure-sensor-link"
 version = "0.1.0"
 edition = "2024"
+# sha2 0.11 and proptest 1.12 need 1.88.
+rust-version = "1.88"
 description = "Receiver that decodes, authenticates and time-synchronizes camera frames from an untrusted link"
 publish = false
 

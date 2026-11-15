@@ -1,0 +1,8 @@
+# Send the build only what it needs: everything else is excluded.
+*
+!Cargo.toml
+!Cargo.lock
+!rustfmt.toml
+!src
+!tests
+!examples

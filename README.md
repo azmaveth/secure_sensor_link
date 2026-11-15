@@ -9,9 +9,53 @@ Runtime dependencies are limited to what the spec allows: `serde` and
 `serde_json` (JSON), `hex`, and `hmac` with `sha2` (HMAC-SHA256). `proptest`
 is used only in tests.
 
-## Build and run
+## Build, test and run with Docker
 
-Requires a stable Rust toolchain (edition 2024, Rust 1.85 or newer).
+No Rust toolchain is needed on the host, only Docker with BuildKit (the
+default since Docker 23).
+
+Run the formatting check, clippy and the full test suite:
+
+```bash
+docker build --target test --progress=plain .
+```
+
+Build the runtime image, then run the spec's example sessions through it:
+
+```bash
+docker build -t secure-sensor-link .
+```
+
+```bash
+docker run --rm -i secure-sensor-link < examples/spec_session.jsonl
+```
+
+Keep `-i`: the receiver reads its commands from stdin. Responses go to
+stdout and diagnostics to stderr, as below.
+
+- The image pins Rust 1.99, the version the project is tested with. To check
+  the minimum supported version instead:
+
+  ```bash
+  docker build --target test --build-arg RUST_VERSION=1.88 --progress=plain .
+  ```
+
+- Docker caches the test step like any other, so it won't run again if
+  nothing changed. To force it while keeping the compiled dependencies:
+
+  ```bash
+  docker build --target test --build-arg RERUN=$(date +%s) --progress=plain .
+  ```
+
+  Avoid `--no-cache` for this: it also empties the build cache, so every
+  dependency is compiled again.
+
+- Downloaded crates and compiled dependencies are kept in BuildKit's cache
+  between builds, so a rebuild after an edit only recompiles this crate.
+
+## Build and run with Cargo
+
+Requires Rust 1.88 or newer (edition 2024).
 
 ```bash
 cargo build --release
@@ -92,3 +136,4 @@ cargo fmt --check
 | `src/nvs.rs` | simulated non-volatile store; counts writes |
 | `src/response.rs` | response JSON shapes |
 | `src/event.rs` | diagnostic events written to stderr |
+| `Dockerfile` | toolchain, test, build and runtime stages; `.dockerignore` sends the build only what it needs |
