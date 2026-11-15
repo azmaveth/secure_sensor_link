@@ -88,6 +88,17 @@ fn each_new_size_record_is_logged_once_per_camera() {
 }
 
 #[test]
+fn a_replayed_oversized_frame_is_logged_once() {
+    let mut rx = Rx::new(json!({}));
+    let oversized = frame(1, 5, 0).tree(&T::spine(70));
+    assert!(rx.reject(&oversized).contains("tree is too large"));
+    for _ in 0..100 {
+        assert_eq!(rx.reject(&oversized), "stale or replayed frame: cam1 seq 5");
+    }
+    assert_eq!(rx.receiver.take_events(), vec![rejected("cam1", 5, 70, 70)]);
+}
+
+#[test]
 fn records_start_over_after_a_restart() {
     let mut rx = Rx::new(json!({}));
     assert_eq!(accept_tree(&mut rx, 1, 1, &T::leaf(0)).len(), 1);

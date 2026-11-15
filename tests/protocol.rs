@@ -134,6 +134,35 @@ fn authentic_frame_with_invalid_tree_is_rejected_without_consuming_its_seq() {
 }
 
 #[test]
+fn exact_repeats_of_a_rejected_authentic_frame_are_reported_as_replays() {
+    let mut rx = Rx::new(no_overrides());
+    let bad = frame(1, 5, 1000).payload(vec![2]);
+    assert!(rx.reject(&bad).starts_with("malformed frame: invalid tree"));
+    for _ in 0..3 {
+        assert_eq!(rx.reject(&bad), "stale or replayed frame: cam1 seq 5");
+    }
+    let before = rx.state();
+    assert_eq!(before["cameras"]["cam1"]["last_seq"], Value::Null, "the seq is still not consumed");
+
+    // Only byte-identical repeats match: a different frame with the same seq
+    // and a lower seq are both still judged on their own.
+    assert!(rx.reject(&frame(1, 5, 1000).payload(vec![3])).starts_with("malformed frame: invalid tree"));
+    rx.accept(&frame(1, 4, 950));
+    rx.accept(&frame(1, 5, 1000));
+    assert_eq!(rx.reject(&bad), "stale or replayed frame: cam1 seq 5");
+}
+
+#[test]
+fn rejected_frames_are_forgotten_after_a_restart() {
+    let mut rx = Rx::new(no_overrides());
+    let bad = frame(1, 5, 1000).payload(vec![2]);
+    rx.reject(&bad);
+    assert!(rx.reject(&bad).starts_with("stale or replayed"));
+    rx.restart();
+    assert!(rx.reject(&bad).starts_with("malformed frame: invalid tree"));
+}
+
+#[test]
 fn tree_limits_are_enforced_through_receive() {
     let mut rx = Rx::new(no_overrides());
     rx.accept(&frame(1, 1, 0).tree(&T::spine(64)));

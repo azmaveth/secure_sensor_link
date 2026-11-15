@@ -34,7 +34,7 @@ pub struct Frame<'a> {
     pub payload: &'a [u8],
     /// Bytes `[0, header + payload_len)`, which the tag covers.
     authenticated: &'a [u8],
-    tag: &'a [u8],
+    tag: &'a [u8; TAG_LEN],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +116,12 @@ pub fn parse(bytes: &[u8]) -> Result<Frame<'_>, FrameError> {
         return Err(FrameError::NegativeTimestamp(timestamp));
     }
 
-    let (authenticated, tag) = bytes.split_at(header_len + usize::from(payload_len));
+    // The length checks above guarantee the tag is there.
+    let (authenticated, tag) = bytes.split_last_chunk::<TAG_LEN>().ok_or(FrameError::TooShort {
+        version,
+        min,
+        actual: bytes.len(),
+    })?;
     Ok(Frame {
         version,
         camera,
@@ -137,6 +142,12 @@ impl Frame<'_> {
         };
         mac.update(self.authenticated);
         mac.verify_slice(self.tag).is_ok()
+    }
+
+    /// The frame's tag. Two authentic frames with the same tag are
+    /// byte-identical, so it identifies a frame.
+    pub fn tag(&self) -> &[u8; TAG_LEN] {
+        self.tag
     }
 }
 

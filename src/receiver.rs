@@ -2,12 +2,15 @@
 //!
 //! State is split by what survives a restart: [`Nvs`] does, [`Ram`] does not.
 //! Every command validates fully before it changes anything, so a command
-//! that returns an error leaves the receiver exactly as it was.
+//! that returns an error leaves the receiver as it was. The one exception is
+//! [`RejectedFrames`]: an authentic frame rejected for its payload is
+//! remembered so that exact repeats are recognised as replays. That never
+//! changes which frames are accepted.
 
 use crate::camera::{Camera, PerCamera};
 use crate::command::{self, Command, Config};
 use crate::event::Event;
-use crate::frame::{self, Frame, Key};
+use crate::frame::{self, Frame, Key, TAG_LEN};
 use crate::nvs::Nvs;
 use crate::response::{
     CameraView, CamerasView, FrameView, KeyStatus, KeyView, Payload, ReceiveView, Response, StateView,
@@ -26,12 +29,51 @@ struct Ram {
     /// Largest node count and largest depth among trees accepted since boot.
     /// The two maxima may come from different frames.
     largest_tree: PerCamera<Shape>,
+    rejected: PerCamera<RejectedFrames>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Last {
     seq: u32,
     timestamp: i128,
+}
+
+/// How many rejected frames each camera remembers.
+const MAX_REJECTED_FRAMES: usize = 8;
+
+/// Authentic frames from one camera that were rejected for their payload,
+/// identified by seq and tag, kept while their seq is above `last_seq`.
+///
+/// Rejected frames don't count for replay protection (D2), so a recording of
+/// one would otherwise pass the replay check every time it is resent, and be
+/// parsed (and, if oversized, logged) again. A byte-identical repeat can only
+/// fail the same way, so rejecting it early changes no outcome; a different
+/// frame with the same seq doesn't match and is checked normally.
+#[derive(Debug, Default, Clone)]
+struct RejectedFrames(Vec<(u32, [u8; TAG_LEN])>);
+
+impl RejectedFrames {
+    fn contains(&self, seq: u32, tag: &[u8; TAG_LEN]) -> bool {
+        self.0.iter().any(|(s, t)| *s == seq && t == tag)
+    }
+
+    /// Remembers a frame, forgetting the one with the lowest seq if full.
+    fn insert(&mut self, seq: u32, tag: &[u8; TAG_LEN]) {
+        if self.contains(seq, tag) {
+            return;
+        }
+        if self.0.len() >= MAX_REJECTED_FRAMES
+            && let Some(lowest) = self.0.iter().enumerate().min_by_key(|(_, (s, _))| *s).map(|(i, _)| i)
+        {
+            self.0.swap_remove(lowest);
+        }
+        self.0.push((seq, *tag));
+    }
+
+    /// Forgets frames at or below `last_seq`: the replay check covers them.
+    fn forget_through(&mut self, last_seq: u32) {
+        self.0.retain(|(s, _)| *s > last_seq);
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -102,8 +144,11 @@ impl Receiver {
             return Err(format!("authentication failed for {camera}"));
         }
 
-        // 4. Freshness.
-        if self.replay_floor(camera).is_some_and(|floor| u64::from(frame.seq) <= floor) {
+        // 4. Freshness: above the replay bar, and not a repeat of an
+        //    authentic frame already rejected for its payload.
+        if self.replay_floor(camera).is_some_and(|floor| u64::from(frame.seq) <= floor)
+            || self.ram.rejected[camera].contains(frame.seq, frame.tag())
+        {
             return Err(format!("stale or replayed frame: {camera} seq {}", frame.seq));
         }
 
@@ -111,6 +156,7 @@ impl Receiver {
         let tree = match tree::decode(frame.payload) {
             Ok(tree) => tree,
             Err(e) => {
+                self.ram.rejected[camera].insert(frame.seq, frame.tag());
                 if let TreeError::TooLarge(shape) = e {
                     self.events.push(Event::TreeRejected {
                         camera: camera.name(),
@@ -136,6 +182,7 @@ impl Receiver {
             self.nvs.write_current_key(camera, frame.key_id);
         }
         self.ram.last[camera] = Some(Last { seq: frame.seq, timestamp });
+        self.ram.rejected[camera].forget_through(frame.seq);
         self.note_tree_size(&frame, tree.shape());
         let synced = self.ram.sync.push(
             camera,
@@ -306,6 +353,39 @@ mod tests {
 
     fn config() -> Config {
         Config { period_ms: 50, max_jitter_ms: 5, pair_window_ms: 20, max_pending: 4, persist_interval: 100 }
+    }
+
+    #[test]
+    fn rejected_frames_match_on_seq_and_tag() {
+        let mut memo = RejectedFrames::default();
+        memo.insert(7, &[1; TAG_LEN]);
+        assert!(memo.contains(7, &[1; TAG_LEN]));
+        assert!(!memo.contains(7, &[2; TAG_LEN]), "same seq, different frame");
+        assert!(!memo.contains(8, &[1; TAG_LEN]));
+        memo.insert(7, &[1; TAG_LEN]);
+        assert_eq!(memo.0.len(), 1, "no duplicates");
+    }
+
+    #[test]
+    fn rejected_frames_are_bounded_and_drop_the_lowest_seq() {
+        let mut memo = RejectedFrames::default();
+        for seq in 10..30 {
+            memo.insert(seq, &[seq as u8; TAG_LEN]);
+        }
+        assert_eq!(memo.0.len(), MAX_REJECTED_FRAMES);
+        let mut seqs: Vec<u32> = memo.0.iter().map(|(s, _)| *s).collect();
+        seqs.sort();
+        assert_eq!(seqs, (22..30).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn rejected_frames_are_forgotten_once_the_replay_bar_passes_them() {
+        let mut memo = RejectedFrames::default();
+        for seq in [3, 5, 9] {
+            memo.insert(seq, &[0; TAG_LEN]);
+        }
+        memo.forget_through(5);
+        assert_eq!(memo.0, vec![(9, [0; TAG_LEN])]);
     }
 
     #[test]
