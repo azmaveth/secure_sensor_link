@@ -136,10 +136,11 @@ fn authentic_frame_with_invalid_tree_is_rejected_without_consuming_its_seq() {
 #[test]
 fn tree_limits_are_enforced_through_receive() {
     let mut rx = Rx::new(no_overrides());
-    let spine =
-        |depth: usize| (0..depth).fold(T::Nil, |t, i| T::Node(i as i32, Box::new(t), Box::new(T::Nil)));
-    rx.accept(&frame(1, 1, 0).tree(&spine(64)));
-    assert!(rx.reject(&frame(1, 2, 50).tree(&spine(65))).contains("deeper than 64"));
+    rx.accept(&frame(1, 1, 0).tree(&T::spine(64)));
+    assert_eq!(
+        rx.reject(&frame(1, 2, 50).tree(&T::spine(65))),
+        "malformed frame: invalid tree: tree is too large: 65 nodes, depth 65 (limits are 1024 nodes, depth 64)"
+    );
 }
 
 // ---------------------------------------------------------------- timestamps
@@ -377,7 +378,7 @@ fn replay_writes_stay_within_the_endurance_budget() {
 
 fn run_lines(input: &[u8]) -> Vec<Value> {
     let mut out = Vec::new();
-    secure_sensor_link::run(input, &mut out).unwrap();
+    secure_sensor_link::run(input, &mut out, std::io::sink()).unwrap();
     String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 

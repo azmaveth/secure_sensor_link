@@ -12,12 +12,14 @@
 //! - [`sync`]: pairing frames from the two cameras.
 //! - [`nvs`]: the simulated non-volatile store that survives restarts.
 //! - [`response`]: response JSON shapes.
+//! - [`event`]: diagnostics for operators, written to stderr.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod camera;
 pub mod command;
+pub mod event;
 pub mod frame;
 pub mod line_reader;
 pub mod nvs;
@@ -34,8 +36,10 @@ use receiver::Receiver;
 use response::Response;
 
 /// Runs the receiver over `input` until end of input, writing one response
-/// line per input line and flushing after each.
-pub fn run<R: BufRead, W: Write>(input: R, mut output: W) -> io::Result<()> {
+/// line per input line to `output` and flushing after each. Diagnostic
+/// events go to `log`, one JSON line each. A failure to write the log is
+/// ignored: diagnostics must never stop the receiver.
+pub fn run<R: BufRead, W: Write, L: Write>(input: R, mut output: W, mut log: L) -> io::Result<()> {
     let mut lines = BoundedLines::new(input, MAX_LINE_LEN);
     let mut receiver = Receiver::new();
     while let Some(line) = lines.next_line()? {
@@ -49,6 +53,10 @@ pub fn run<R: BufRead, W: Write>(input: R, mut output: W) -> io::Result<()> {
         };
         writeln!(output, "{}", response.to_json())?;
         output.flush()?;
+        for event in receiver.take_events() {
+            let _ = writeln!(log, "{}", event.to_json());
+        }
+        let _ = log.flush();
     }
     Ok(())
 }
