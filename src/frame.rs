@@ -54,7 +54,7 @@ impl fmt::Display for FrameError {
         f.write_str("malformed frame: ")?;
         match self {
             FrameError::TooLong { hex_digits } => {
-                write!(f, "{hex_digits} hex digits is longer than any valid frame ({} bytes)", MAX_FRAME_LEN)
+                write!(f, "{hex_digits} hex digits is longer than any valid frame ({MAX_FRAME_LEN} bytes)")
             }
             FrameError::InvalidHex => f.write_str("not valid hex"),
             FrameError::Empty => f.write_str("frame is empty"),
