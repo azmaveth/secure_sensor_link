@@ -6,13 +6,14 @@
 
 use crate::camera::{Camera, PerCamera};
 use crate::command::{self, Command, Config};
-use crate::frame::{self, Key};
+use crate::event::Event;
+use crate::frame::{self, Frame, Key};
 use crate::nvs::Nvs;
 use crate::response::{
     CameraView, CamerasView, FrameView, KeyStatus, KeyView, Payload, ReceiveView, Response, StateView,
 };
 use crate::sync::{Pending, Synchronizer};
-use crate::tree;
+use crate::tree::{self, MAX_DEPTH, MAX_NODES, Shape, TreeError};
 
 const NOT_INITIALIZED: &str = "receiver is not initialized: the first command must be init";
 
@@ -22,6 +23,9 @@ struct Ram {
     /// Seq and corrected timestamp of the last frame accepted since boot.
     last: PerCamera<Option<Last>>,
     sync: Synchronizer,
+    /// Largest node count and largest depth among trees accepted since boot.
+    /// The two maxima may come from different frames.
+    largest_tree: PerCamera<Shape>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,11 +38,18 @@ struct Last {
 pub struct Receiver {
     nvs: Nvs,
     ram: Ram,
+    /// Diagnostics produced by the current command, not yet written out.
+    events: Vec<Event>,
 }
 
 impl Receiver {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Removes and returns the diagnostics queued since the last call.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
     }
 
     /// Handles one line of input and returns its response.
@@ -97,7 +108,23 @@ impl Receiver {
         }
 
         // 5. Payload.
-        let tree = tree::decode(frame.payload).map_err(|e| format!("malformed frame: invalid tree: {e}"))?;
+        let tree = match tree::decode(frame.payload) {
+            Ok(tree) => tree,
+            Err(e) => {
+                if let TreeError::TooLarge(shape) = e {
+                    self.events.push(Event::TreeRejected {
+                        camera: camera.name(),
+                        key_id: frame.key_id,
+                        seq: frame.seq,
+                        nodes: shape.nodes,
+                        depth: shape.depth,
+                        limit_nodes: MAX_NODES,
+                        limit_depth: MAX_DEPTH,
+                    });
+                }
+                return Err(format!("malformed frame: invalid tree: {e}"));
+            }
+        };
 
         // 6. Timestamp.
         let (timestamp, corrected) =
@@ -109,6 +136,7 @@ impl Receiver {
             self.nvs.write_current_key(camera, frame.key_id);
         }
         self.ram.last[camera] = Some(Last { seq: frame.seq, timestamp });
+        self.note_tree_size(&frame, tree.shape());
         let synced = self.ram.sync.push(
             camera,
             Pending { seq: frame.seq, timestamp, key_id: frame.key_id },
@@ -127,6 +155,28 @@ impl Receiver {
             },
             synced,
         }))
+    }
+
+    /// Logs an accepted tree that is larger, in nodes or in depth, than any
+    /// earlier one from its camera since boot. Each event raises a maximum by
+    /// at least one, so there are at most `MAX_NODES + MAX_DEPTH` per camera
+    /// per boot.
+    fn note_tree_size(&mut self, frame: &Frame<'_>, shape: Shape) {
+        let largest = &mut self.ram.largest_tree[frame.camera];
+        if shape.nodes <= largest.nodes && shape.depth <= largest.depth {
+            return;
+        }
+        largest.nodes = largest.nodes.max(shape.nodes);
+        largest.depth = largest.depth.max(shape.depth);
+        self.events.push(Event::TreeSizeRecord {
+            camera: frame.camera.name(),
+            key_id: frame.key_id,
+            seq: frame.seq,
+            nodes: shape.nodes,
+            depth: shape.depth,
+            max_nodes_seen: largest.nodes,
+            max_depth_seen: largest.depth,
+        });
     }
 
     fn usable_key(&self, camera: Camera, key_id: u8) -> Result<&Key, String> {

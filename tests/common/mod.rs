@@ -32,6 +32,20 @@ impl T {
         T::Node(v, Box::new(T::Nil), Box::new(T::Nil))
     }
 
+    /// A left spine: `depth` nodes, each the left child of the one before.
+    pub fn spine(depth: usize) -> T {
+        (0..depth).fold(T::Nil, |t, i| T::Node(i as i32, Box::new(t), Box::new(T::Nil)))
+    }
+
+    /// `n` nodes arranged with the least possible depth.
+    pub fn balanced(n: usize) -> T {
+        if n == 0 {
+            return T::Nil;
+        }
+        let left = (n - 1) / 2;
+        T::Node(n as i32, Box::new(T::balanced(left)), Box::new(T::balanced(n - 1 - left)))
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.encode_into(&mut out);

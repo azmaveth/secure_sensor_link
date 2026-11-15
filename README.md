@@ -29,6 +29,25 @@ Or type commands interactively. Each line gets exactly one response line:
 ./target/release/receiver
 ```
 
+### Diagnostics on stderr
+
+Stdout carries only the responses, one per command. Diagnostic events go to
+stderr, one JSON object per line:
+
+| Event | When | Fields |
+|---|---|---|
+| `tree_rejected` | An authentic frame's tree breaks the 1,024-node or depth-64 limit | `camera`, `key_id`, `seq`, the tree's full `nodes` and `depth`, `limit_nodes`, `limit_depth` |
+| `tree_size_record` | An accepted tree has more nodes, or more depth, than any earlier tree from that camera since the receiver started | `camera`, `key_id`, `seq`, the tree's `nodes` and `depth`, and the camera's `max_nodes_seen` and `max_depth_seen` |
+
+To keep them in a file:
+
+```bash
+./target/release/receiver < examples/spec_session.jsonl 2> receiver.log
+```
+
+Events carry no timestamps (the receiver has no wall clock), so whatever
+collects stderr should add them.
+
 ## Test
 
 ```bash
@@ -40,6 +59,7 @@ cargo test
 | unit tests in `src/` | frame layout, tree codec and limits, command validation, line reader, pairing, timestamp correction |
 | `tests/spec_examples.rs` | all 24 steps of the spec's three example sessions, in-process and through the binary |
 | `tests/protocol.rs` | one rule at a time: replay, tampering, malformed input, correction, sync, key rules, restarts, NVS write budget, oversized lines |
+| `tests/size_logging.rs` | tree-size diagnostics: rejections report the full size, records are logged once per camera, events go only to the log stream, and a failing log doesn't stop the receiver |
 | `tests/properties.rs` | property tests: tree round trips, arbitrary bytes and lines never break the receiver, and over random sessions with restarts: restart safety, post-restart liveness, the NVS write budget and the queue bound |
 
 `tests/data/*.jsonl` holds the spec examples as `{"in": …, "out": …}` pairs,
@@ -71,3 +91,4 @@ cargo fmt --check
 | `src/sync.rs` | per-camera queues and pairing |
 | `src/nvs.rs` | simulated non-volatile store; counts writes |
 | `src/response.rs` | response JSON shapes |
+| `src/event.rs` | diagnostic events written to stderr |

@@ -89,13 +89,15 @@ fn follow_on_2_example() {
     check(&steps, &run_in_process(&steps));
 }
 
-/// The same sessions through the real binary over stdin and stdout.
+/// The same sessions through the real binary over stdin and stdout. The
+/// only diagnostic on stderr is cam1's first tree setting its size record.
 #[test]
 fn binary_reproduces_all_examples() {
     let steps = steps(&[BASE, FOLLOW_ON_1, FOLLOW_ON_2]);
     let mut child = Command::new(env!("CARGO_BIN_EXE_receiver"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     {
@@ -108,4 +110,12 @@ fn binary_reproduces_all_examples() {
     assert!(output.status.success());
     let lines: Vec<String> = String::from_utf8(output.stdout).unwrap().lines().map(String::from).collect();
     check(&steps, &lines);
+
+    let log: Vec<Value> =
+        String::from_utf8(output.stderr).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(
+        log,
+        vec![serde_json::json!({"event":"tree_size_record","camera":"cam1","key_id":0,"seq":1,
+                                "nodes":5,"depth":3,"max_nodes_seen":5,"max_depth_seen":3})]
+    );
 }
