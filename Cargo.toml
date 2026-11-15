@@ -1,0 +1,33 @@
+[package]
+name = "secure-sensor-link"
+version = "0.1.0"
+edition = "2024"
+description = "Receiver that decodes, authenticates and time-synchronizes camera frames from an untrusted link"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "receiver"
+path = "src/main.rs"
+
+# Runtime dependencies are limited by the spec to: a JSON library (serde +
+# serde_json), a hex library (hex), and a vetted HMAC-SHA256 library
+# (hmac + sha2).
+[dependencies]
+hex = "0.4.3"
+hmac = "0.13.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+
+# Test-only dependencies are unrestricted.
+[dev-dependencies]
+proptest = "1.12.0"
+
+[profile.release]
+# Keep arithmetic overflow checks on in release builds too. The receiver is
+# written so overflow cannot happen; if it ever did, failing one command
+# beats silently wrapping a sequence number or timestamp.
+overflow-checks = true
