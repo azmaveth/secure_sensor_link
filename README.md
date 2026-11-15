@@ -59,7 +59,7 @@ cargo test
 | unit tests in `src/` | frame layout, tree codec and limits, command validation, line reader, pairing, timestamp correction |
 | `tests/spec_examples.rs` | all 24 steps of the spec's three example sessions, in-process and through the binary |
 | `tests/protocol.rs` | one rule at a time: replay, tampering, malformed input, correction, sync, key rules, restarts, NVS write budget, oversized lines |
-| `tests/size_logging.rs` | tree-size diagnostics: rejections report the full size, records are logged once per camera, events go only to the log stream, and a failing log doesn't stop the receiver |
+| `tests/size_logging.rs` | tree-size diagnostics: rejections report the full size, a replayed oversized frame is logged once, records are logged once per camera, events go only to the log stream, and a failing log doesn't stop the receiver |
 | `tests/properties.rs` | property tests: tree round trips, arbitrary bytes and lines never break the receiver, and over random sessions with restarts: restart safety, post-restart liveness, the NVS write budget and the queue bound |
 
 `tests/data/*.jsonl` holds the spec examples as `{"in": …, "out": …}` pairs,
