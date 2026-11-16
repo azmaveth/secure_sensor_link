@@ -34,10 +34,10 @@ fn main() -> ExitCode {
     let result = if diagnostics == Diagnostics::Off {
         secure_sensor_link::run(input, output, io::sink(), diagnostics)
     } else {
-        // Events go to stderr through a bounded queue and a writer thread,
+        // Events go to stderr through bounded queues and a writer thread,
         // so a stderr that nobody reads can't stop the receiver.
         let mut log = BackgroundLog::spawn(io::stderr(), DEFAULT_QUEUE_LINES);
-        let result = secure_sensor_link::run(input, output, &mut log, diagnostics);
+        let result = secure_sensor_link::run_with_sink(input, output, &mut log, diagnostics);
         log.finish(LOG_DRAIN_GRACE);
         result
     };

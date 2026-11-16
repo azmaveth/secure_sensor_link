@@ -1,147 +1,211 @@
-//! A log stream that never makes its writer wait.
+//! Where diagnostic events go, and a log that never makes the receiver wait.
 //!
 //! Writing diagnostics straight to stderr can block: if stderr is a pipe
 //! that nobody reads, a write waits once the pipe is full, and the receiver
-//! would stop answering commands. [`BackgroundLog`] hands each line to a
-//! thread through a bounded queue instead. When the queue is full the line
-//! is dropped and counted, and the count is reported in an `events_dropped`
-//! line once there is room again. The receiver's own thread never waits on
-//! the log, and the queue's size bounds the memory it can hold.
+//! would stop answering commands. [`BackgroundLog`] queues each event for a
+//! writer thread instead. The receiver's own thread never waits on the log,
+//! and the queues' sizes bound the memory they can hold.
+//!
+//! There are two queues. Security events ([`Event::is_security`]) have one
+//! to themselves, and the writer thread takes from it first. Those events
+//! are few by construction: per camera, at most 256 `key_revoked` and two
+//! `final_key_id` for the life of the store, and one `timestamp_beyond_i64`
+//! per boot. That is under 520 lines for both cameras, so a queue of
+//! [`DEFAULT_QUEUE_LINES`] holds everything one boot can produce, and no
+//! amount of other events can push a security event out. Only many restarts
+//! while the log stays blocked could fill it.
+//!
+//! When a queue is full the event is dropped and counted. The writer thread
+//! reports the counts in an `events_dropped` line as soon as the log accepts
+//! a line again; the report takes no queue space, so it can't be dropped.
 
-use std::io::{self, Write};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::collections::VecDeque;
+use std::io::Write;
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::event::Event;
 
-/// Lines the queue holds before new ones are dropped. A line is a few
-/// hundred bytes, so this is well under a megabyte.
+/// Lines each queue holds before new ones are dropped. A line is a few
+/// hundred bytes, so both queues together stay well under a megabyte.
 pub const DEFAULT_QUEUE_LINES: usize = 1024;
 
-/// Longest line accepted. Events are far shorter; anything longer is
-/// dropped rather than buffered.
-const MAX_LINE_LEN: usize = 16 * 1024;
+/// Somewhere diagnostic events can be sent. Sending must not fail: a log
+/// that can't take an event deals with that itself.
+pub trait EventSink {
+    fn emit(&mut self, event: &Event);
+}
+
+impl<S: EventSink + ?Sized> EventSink for &mut S {
+    fn emit(&mut self, event: &Event) {
+        (**self).emit(event);
+    }
+}
+
+/// Writes each event to `W` as a JSON line, at once, on the caller's thread.
+/// Write errors are ignored. Right for a buffer or a file; for a stream that
+/// can block, use [`BackgroundLog`].
+pub struct LineSink<W>(pub W);
+
+impl<W: Write> EventSink for LineSink<W> {
+    fn emit(&mut self, event: &Event) {
+        let _ = writeln!(self.0, "{}", event.to_json());
+        let _ = self.0.flush();
+    }
+}
+
+/// Events dropped and not yet reported, by class.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Dropped {
+    pub security: u64,
+    pub other: u64,
+}
+
+#[derive(Default)]
+struct Queues {
+    security: VecDeque<Vec<u8>>,
+    other: VecDeque<Vec<u8>>,
+    dropped: Dropped,
+    /// No more events are coming; the writer stops once the queues are empty.
+    closed: bool,
+}
+
+#[derive(Default)]
+struct Shared {
+    queues: Mutex<Queues>,
+    /// Signalled when there is something for the writer thread to do.
+    ready: Condvar,
+}
+
+impl Shared {
+    /// The lock is only ever held for a push or a pop, so a poisoned lock
+    /// still guards consistent queues.
+    fn lock(&self) -> MutexGuard<'_, Queues> {
+        self.queues.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// What the writer thread does next.
+enum Next {
+    Line(Vec<u8>),
+    Report(Dropped),
+    Stop,
+}
 
 pub struct BackgroundLog {
-    /// `None` once finished, or if the writer thread could not be started;
-    /// every line is then dropped.
-    sender: Option<SyncSender<Vec<u8>>>,
+    shared: Arc<Shared>,
+    capacity: usize,
     /// Signalled by the writer thread when it has written everything.
     done: Receiver<()>,
-    /// Bytes of the line being assembled, up to its newline.
-    line: Vec<u8>,
-    /// The current line outgrew [`MAX_LINE_LEN`]; skip to its newline.
-    skipping: bool,
-    /// Lines dropped since the last `events_dropped` line was queued.
-    dropped: u64,
+    /// False if the writer thread could not be started; events are then
+    /// discarded.
+    running: bool,
 }
 
 impl BackgroundLog {
-    /// Starts a thread that writes queued lines to `sink`, flushing after
-    /// each, and ignores write errors. If the thread can't be started, the
-    /// log drops everything; the receiver carries on either way.
+    /// Starts a thread that writes queued events to `sink` as JSON lines,
+    /// flushing after each and ignoring write errors. Each of the two queues
+    /// holds `queue_lines` lines. If the thread can't be started, the log
+    /// discards everything; the receiver carries on either way.
     pub fn spawn<W: Write + Send + 'static>(mut sink: W, queue_lines: usize) -> Self {
-        let (sender, lines) = sync_channel::<Vec<u8>>(queue_lines);
+        let shared = Arc::new(Shared::default());
         let (finished, done) = sync_channel::<()>(1);
+        let for_writer = Arc::clone(&shared);
         let writer = thread::Builder::new().name("log-writer".into()).spawn(move || {
-            for line in lines {
+            loop {
+                let line = match next(&for_writer) {
+                    Next::Line(line) => line,
+                    Next::Report(dropped) => {
+                        line_for(&Event::EventsDropped { security: dropped.security, other: dropped.other })
+                    }
+                    Next::Stop => break,
+                };
                 let _ = sink.write_all(&line);
                 let _ = sink.flush();
             }
             let _ = finished.send(());
         });
-        BackgroundLog {
-            sender: writer.is_ok().then_some(sender),
-            done,
-            line: Vec::new(),
-            skipping: false,
-            dropped: 0,
-        }
+        BackgroundLog { shared, capacity: queue_lines, done, running: writer.is_ok() }
     }
 
-    /// Lines dropped and not yet reported.
-    pub fn dropped(&self) -> u64 {
-        self.dropped
+    /// Events dropped and not yet reported.
+    pub fn dropped(&self) -> Dropped {
+        self.shared.lock().dropped
     }
 
-    /// Stops taking lines and waits up to `grace` for the queued ones to be
+    /// Stops taking events and waits up to `grace` for the queued ones to be
     /// written. If the sink is still blocked after that, they are abandoned:
     /// shutting down must not hang on the log either.
-    pub fn finish(mut self, grace: Duration) {
-        let deadline = Instant::now() + grace;
-        // The last `events_dropped` line needs room in the queue; give the
-        // writer thread until the deadline to make some.
-        while !self.report_dropped() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
+    pub fn finish(self, grace: Duration) {
+        self.shared.lock().closed = true;
+        self.shared.ready.notify_one();
+        if self.running {
+            let _ = self.done.recv_timeout(grace);
         }
-        // Closing the queue lets the writer thread run out of lines and stop.
-        self.sender = None;
-        let _ = self.done.recv_timeout(deadline.saturating_duration_since(Instant::now()));
-    }
-
-    /// Queues one complete line, or drops it if there is no room.
-    fn submit(&mut self, line: Vec<u8>) {
-        if !self.report_dropped() || !self.try_send(line) {
-            self.dropped += 1;
-        }
-    }
-
-    /// Queues the `events_dropped` line if any are owed. Returns whether
-    /// nothing is owed any more.
-    fn report_dropped(&mut self) -> bool {
-        if self.dropped == 0 {
-            return true;
-        }
-        let mut notice = Event::EventsDropped { count: self.dropped }.to_json().into_bytes();
-        notice.push(b'\n');
-        let sent = self.try_send(notice);
-        if sent {
-            self.dropped = 0;
-        }
-        sent
-    }
-
-    fn try_send(&self, line: Vec<u8>) -> bool {
-        self.sender.as_ref().is_some_and(|sender| sender.try_send(line).is_ok())
     }
 }
 
-impl Write for BackgroundLog {
-    /// Never blocks and never fails: bytes are gathered into lines, and each
-    /// complete line is queued or dropped.
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        for chunk in bytes.split_inclusive(|&b| b == b'\n') {
-            let ends_line = chunk.last() == Some(&b'\n');
-            if !self.skipping {
-                if self.line.len() + chunk.len() > MAX_LINE_LEN {
-                    self.line = Vec::new();
-                    self.skipping = true;
-                    self.dropped += 1;
-                } else {
-                    self.line.extend_from_slice(chunk);
-                }
-            }
-            if ends_line {
-                if !self.skipping {
-                    let line = std::mem::take(&mut self.line);
-                    self.submit(line);
-                }
-                self.skipping = false;
+impl EventSink for BackgroundLog {
+    /// Queues the event, or counts it as dropped if its queue is full. Never
+    /// waits for the sink.
+    fn emit(&mut self, event: &Event) {
+        if !self.running {
+            return;
+        }
+        let line = line_for(event);
+        {
+            let mut guard = self.shared.lock();
+            // Borrow the fields through one plain reference, so two of them
+            // can be borrowed at once.
+            let queues = &mut *guard;
+            let (queue, dropped) = if event.is_security() {
+                (&mut queues.security, &mut queues.dropped.security)
+            } else {
+                (&mut queues.other, &mut queues.dropped.other)
+            };
+            if queue.len() < self.capacity {
+                queue.push_back(line);
+            } else {
+                *dropped += 1;
             }
         }
-        Ok(bytes.len())
+        self.shared.ready.notify_one();
     }
+}
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+fn line_for(event: &Event) -> Vec<u8> {
+    let mut line = event.to_json().into_bytes();
+    line.push(b'\n');
+    line
+}
+
+/// Waits for the writer thread's next job. A report of dropped events comes
+/// first: the thread only gets here once the sink has taken the previous
+/// line, so this is the earliest moment the report can be written. Then
+/// security events, then the rest.
+fn next(shared: &Shared) -> Next {
+    let mut queues = shared.lock();
+    loop {
+        if queues.dropped != Dropped::default() {
+            return Next::Report(std::mem::take(&mut queues.dropped));
+        }
+        if let Some(line) = queues.security.pop_front().or_else(|| queues.other.pop_front()) {
+            return Next::Line(line);
+        }
+        if queues.closed {
+            return Next::Stop;
+        }
+        queues = shared.ready.wait(queues).unwrap_or_else(PoisonError::into_inner);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     use super::*;
 
@@ -165,25 +229,12 @@ mod tests {
                 .map(String::from)
                 .collect()
         }
-
-        /// Waits until the writer thread has taken `n` lines off the queue.
-        fn wait_for_writes_started(&self, n: usize) {
-            while self.started.load(Ordering::SeqCst) < n {
-                thread::yield_now();
-            }
-        }
-
-        fn wait_for_lines(&self, n: usize) {
-            while self.lines().len() < n {
-                thread::yield_now();
-            }
-        }
     }
 
     impl Write for Sink {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.started.fetch_add(1, Ordering::SeqCst);
-            let _open = self.gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _open = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
             self.written.lock().unwrap().extend_from_slice(bytes);
             Ok(bytes.len())
         }
@@ -192,84 +243,159 @@ mod tests {
         }
     }
 
+    /// An ordinary event, told apart by `seq`.
+    fn other(seq: u32) -> Event {
+        Event::TreeSizeRecord {
+            camera: "cam1",
+            key_id: 0,
+            seq,
+            nodes: 1,
+            depth: 1,
+            max_nodes_seen: 1,
+            max_depth_seen: 1,
+        }
+    }
+
+    /// A security event, told apart by `key_id`.
+    fn security(key_id: u8) -> Event {
+        Event::KeyRevoked {
+            camera: "cam1",
+            key_id,
+            discarded: 0,
+            replay_bar: None,
+            set_timeline: false,
+            retired_keys: Vec::new(),
+        }
+    }
+
+    fn json(event: &Event) -> String {
+        event.to_json()
+    }
+
+    fn dropped(security: u64, other: u64) -> String {
+        json(&Event::EventsDropped { security, other })
+    }
+
     /// Shuts the sink and gets the writer thread stuck in it holding
-    /// "line 0", so that the queue's contents are known from then on.
-    fn block<'a>(sink: &'a Sink, log: &mut BackgroundLog) -> std::sync::MutexGuard<'a, ()> {
+    /// `other(0)`, so that the queues' contents are known from then on.
+    fn block<'a>(sink: &'a Sink, log: &mut BackgroundLog) -> MutexGuard<'a, ()> {
         let blocked = sink.gate.lock().unwrap();
-        writeln!(log, "line 0").unwrap();
-        sink.wait_for_writes_started(1);
+        log.emit(&other(0));
+        while sink.started.load(Ordering::SeqCst) < 1 {
+            thread::yield_now();
+        }
         blocked
     }
 
     #[test]
-    fn lines_are_written_in_order() {
+    fn events_are_written_in_order() {
         let sink = Sink::default();
         let mut log = BackgroundLog::spawn(sink.clone(), 8);
-        for i in 0..5 {
-            writeln!(log, "line {i}").unwrap();
+        for seq in 0..5 {
+            log.emit(&other(seq));
         }
         log.finish(GRACE);
-        assert_eq!(sink.lines(), ["line 0", "line 1", "line 2", "line 3", "line 4"]);
+        assert_eq!(sink.lines(), (0..5).map(|seq| json(&other(seq))).collect::<Vec<_>>());
     }
 
     #[test]
-    fn a_line_may_arrive_in_pieces() {
+    fn security_events_are_written_ahead_of_the_rest() {
         let sink = Sink::default();
         let mut log = BackgroundLog::spawn(sink.clone(), 8);
-        log.write_all(b"one").unwrap();
-        log.write_all(b"\ntwo\nthr").unwrap();
-        log.write_all(b"ee\n").unwrap();
-        log.write_all(b"unfinished").unwrap();
+        let blocked = block(&sink, &mut log);
+        log.emit(&other(1));
+        log.emit(&other(2));
+        log.emit(&security(7));
+        log.emit(&other(3));
+        log.emit(&security(8));
+        drop(blocked);
         log.finish(GRACE);
-        assert_eq!(sink.lines(), ["one", "two", "three"], "a line with no newline is never written");
+        let expected = [other(0), security(7), security(8), other(1), other(2), other(3)];
+        assert_eq!(sink.lines(), expected.iter().map(json).collect::<Vec<_>>());
     }
 
     #[test]
-    fn a_blocked_sink_drops_lines_instead_of_blocking_the_writer() {
+    fn a_blocked_sink_drops_events_instead_of_blocking_the_receiver() {
         let sink = Sink::default();
         let mut log = BackgroundLog::spawn(sink.clone(), 4);
         let blocked = block(&sink, &mut log);
-        // Far more lines than the queue holds. Every write returns at once;
+        // Far more events than the queue holds. Every call returns at once;
         // if any waited for the sink, the test would hang here.
-        for i in 1..1000 {
-            writeln!(log, "line {i}").unwrap();
+        for seq in 1..1000 {
+            log.emit(&other(seq));
         }
-        assert_eq!(log.dropped(), 995, "the queue kept lines 1 to 4");
+        assert_eq!(log.dropped(), Dropped { security: 0, other: 995 }, "the queue kept 1 to 4");
 
+        drop(blocked);
+        log.finish(GRACE);
+        // The report is written as soon as the sink takes a line again.
+        let mut expected = vec![json(&other(0)), dropped(0, 995)];
+        expected.extend((1..=4).map(|seq| json(&other(seq))));
+        assert_eq!(sink.lines(), expected);
+    }
+
+    #[test]
+    fn a_flood_of_other_events_cannot_push_out_a_security_event() {
+        let sink = Sink::default();
+        let mut log = BackgroundLog::spawn(sink.clone(), 16);
+        let blocked = block(&sink, &mut log);
+        for seq in 1..=5000 {
+            log.emit(&other(seq));
+            if seq % 500 == 0 {
+                log.emit(&security((seq / 500) as u8));
+            }
+        }
+        assert_eq!(log.dropped(), Dropped { security: 0, other: 5000 - 16 });
+        drop(blocked);
+        log.finish(GRACE);
+        let lines = sink.lines();
+        for key_id in 1..=10 {
+            assert!(lines.contains(&json(&security(key_id))), "key_revoked {key_id} was lost");
+        }
+        assert!(lines.contains(&dropped(0, 5000 - 16)));
+    }
+
+    #[test]
+    fn dropped_security_events_are_counted_separately() {
+        let sink = Sink::default();
+        let mut log = BackgroundLog::spawn(sink.clone(), 2);
+        let blocked = block(&sink, &mut log);
+        for key_id in 0..5 {
+            log.emit(&security(key_id));
+        }
+        log.emit(&other(1));
+        assert_eq!(log.dropped(), Dropped { security: 3, other: 0 });
         drop(blocked);
         log.finish(GRACE);
         assert_eq!(
             sink.lines(),
-            ["line 0", "line 1", "line 2", "line 3", "line 4", r#"{"event":"events_dropped","count":995}"#]
+            [json(&other(0)), dropped(3, 0), json(&security(0)), json(&security(1)), json(&other(1))]
         );
     }
 
     #[test]
-    fn dropped_lines_are_reported_before_the_next_line_that_fits() {
+    fn a_later_drop_gets_its_own_report() {
         let sink = Sink::default();
-        let mut log = BackgroundLog::spawn(sink.clone(), 4);
+        let mut log = BackgroundLog::spawn(sink.clone(), 1);
         let blocked = block(&sink, &mut log);
-        for i in 1..50 {
-            writeln!(log, "line {i}").unwrap();
-        }
-        assert_eq!(log.dropped(), 45);
+        log.emit(&other(1));
+        log.emit(&other(2));
         drop(blocked);
-        // Once the five kept lines are written the queue is empty again.
-        sink.wait_for_lines(5);
-        writeln!(log, "late").unwrap();
-        assert_eq!(log.dropped(), 0, "reported");
+        while sink.lines().len() < 3 {
+            thread::yield_now();
+        }
+        assert_eq!(log.dropped(), Dropped::default(), "reported");
+        log.emit(&other(3));
         log.finish(GRACE);
-        assert_eq!(sink.lines()[5..], [r#"{"event":"events_dropped","count":45}"#, "late"]);
+        assert_eq!(sink.lines(), [json(&other(0)), dropped(0, 1), json(&other(1)), json(&other(3))]);
     }
 
     #[test]
-    fn an_overlong_line_is_dropped_and_the_next_one_kept() {
-        let sink = Sink::default();
-        let mut log = BackgroundLog::spawn(sink.clone(), 8);
-        log.write_all(&vec![b'x'; MAX_LINE_LEN + 1]).unwrap();
-        log.write_all(b"still the long line\nnext\n").unwrap();
-        log.finish(GRACE);
-        assert_eq!(sink.lines(), [r#"{"event":"events_dropped","count":1}"#, "next"]);
+    fn line_sink_writes_json_lines_and_ignores_errors() {
+        let mut buffer = Vec::new();
+        LineSink(&mut buffer).emit(&security(1));
+        assert_eq!(String::from_utf8(buffer).unwrap(), format!("{}\n", json(&security(1))));
+        LineSink(Broken).emit(&security(1));
     }
 
     /// A sink that always fails, like a closed stderr.
@@ -287,8 +413,8 @@ mod tests {
     #[test]
     fn a_failing_sink_is_ignored() {
         let mut log = BackgroundLog::spawn(Broken, 2);
-        for i in 0..10 {
-            writeln!(log, "line {i}").unwrap();
+        for seq in 0..10 {
+            log.emit(&other(seq));
         }
         log.finish(GRACE);
     }
@@ -298,8 +424,8 @@ mod tests {
         let sink = Sink::default();
         let mut log = BackgroundLog::spawn(sink.clone(), 4);
         let _blocked = block(&sink, &mut log);
-        for i in 1..10 {
-            writeln!(log, "line {i}").unwrap();
+        for seq in 1..10 {
+            log.emit(&other(seq));
         }
         let started = Instant::now();
         log.finish(Duration::from_millis(100));

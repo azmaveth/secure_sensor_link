@@ -125,12 +125,19 @@ With the default profile nothing reports a revoked key's leftovers, the last
 key id or an oversized timestamp. A deployment that wants those signals
 should run with `security`.
 
-Events are written to stderr by a separate thread, through a queue of 1,024
-lines. If stderr is not being read (a pipe whose reader has stalled), the
-queue fills and further events are dropped rather than making the receiver
-wait; an `events_dropped` line gives the count once stderr accepts lines
-again. Responses are never delayed by the log. At exit the receiver waits up
-to two seconds for queued events to be written.
+Events are written to stderr by a separate thread, so the receiver never
+waits on the log. If stderr is not being read (a pipe whose reader has
+stalled), events queue up, and once a queue is full further ones are dropped.
+Responses are never delayed.
+
+- There are two queues of 1,024 lines. The `security` events have one to
+  themselves and are written first. One boot can produce fewer than 520 of
+  them, so no number of tree-size events can push one out; only many
+  restarts while stderr stays blocked could fill that queue.
+- When events are dropped, an `events_dropped` line says how many of each
+  kind, as soon as stderr accepts a line again.
+- At exit the receiver waits up to two seconds for queued events to be
+  written.
 
 | Event | When | Fields |
 |---|---|---|
@@ -139,7 +146,7 @@ to two seconds for queued events to be written.
 | `key_revoked` | A key is revoked (not when it already was) | `camera`, `key_id`, and what the key leaves behind: `discarded` (its queued frames, dropped), `replay_bar` (the seq a frame must now exceed, if a frame from this key set it, else `null`), `set_timeline` (a frame from this key set the camera's timeline since the receiver started), `retired_keys` (unrevoked lower ids that stay retired because this is the highest key the camera has used) |
 | `final_key_id` | Key id 255 is provisioned for a camera, or a camera moves to it | `camera`, `in_use`. Cameras only move forward through their keys, so a camera on 255 can't be re-keyed |
 | `timestamp_beyond_i64` | An accepted frame's corrected timestamp is above 9223372036854775807 for the first time for that camera since the receiver started | `camera`, `key_id`, `seq`, `timestamp`. The value is exact and fits an unsigned 64-bit integer, but not a signed one. No real clock is near it, so the camera's timeline is following a bad timestamp |
-| `events_dropped` | Events could not be written because stderr was not being read, and stderr now accepts lines again | `count`: how many were dropped. Written under any profile that is not `off` |
+| `events_dropped` | Events could not be written because stderr was not being read, and stderr now accepts lines again | `security` and `other`: how many of each kind were dropped. Written under any profile that is not `off` |
 
 Revoking a key rejects its frames from then on and drops its queued ones. It
 does not undo what earlier frames from that key did: the replay bar, the
@@ -164,7 +171,7 @@ cargo test
 
 | Suite | What it checks |
 |---|---|
-| unit tests in `src/` | frame layout, tree codec and limits, command validation, line reader, pairing, timestamp correction, command-line arguments, the log writer (order, a blocked or failing stream, dropped-line counts) |
+| unit tests in `src/` | frame layout, tree codec and limits, command validation, line reader, pairing, timestamp correction, command-line arguments, the log writer (order, security events first and never pushed out by others, a blocked or failing stream, dropped counts by kind) |
 | `tests/spec_examples.rs` | all 24 steps of the spec's three example sessions, in-process and through the binary: with no arguments (stderr stays empty) and under each diagnostics profile (stdout unchanged); a bad command line is refused |
 | `tests/protocol.rs` | one rule at a time: replay, tampering, malformed input, correction, sync, key rules, restarts, NVS write budget, oversized lines |
 | `tests/size_logging.rs` | tree-size diagnostics: rejections report the full size, replayed oversized frames are logged once however many are cycled, records are logged once per camera, events go only to the log stream, and a failing log doesn't stop the receiver |
@@ -249,7 +256,7 @@ by commit, as the Docker images are by digest.
 | `src/response.rs` | response JSON shapes |
 | `src/event.rs` | diagnostic events written to stderr |
 | `src/diagnostics.rs` | diagnostics profiles (`off`, `security`, `all`) and the `--diagnostics` argument |
-| `src/log_writer.rs` | writes events on a separate thread through a bounded queue, so an unread stderr can't stop the receiver |
+| `src/log_writer.rs` | writes events on a separate thread through two bounded queues, security events first, so an unread stderr can't stop the receiver |
 | `Dockerfile` | audit, toolchain, test, build and runtime stages, on images pinned by digest; `.dockerignore` sends the build only what it needs |
 | `fuzz/` | fuzz targets and `run.sh`, which builds and runs them |
 | `.github/workflows/ci.yml` | tests, dependency audit and a short fuzz run on every pull request and weekly |
