@@ -136,15 +136,25 @@ impl Receiver {
         let frame = frame::parse(&bytes).map_err(|e| e.to_string())?;
         let camera = frame.camera;
 
-        // 2. Key: provisioned, not revoked, not retired.
-        let key = self.usable_key(camera, frame.key_id)?;
+        // 2. Key: the camera has a key with this id.
+        let slot = self
+            .nvs
+            .key(camera, frame.key_id)
+            .ok_or_else(|| format!("{camera} key {} is not provisioned", frame.key_id))?;
 
-        // 3. Authenticity.
-        if !frame.verify(key) {
+        // 3. Authenticity, with the stored key even if it is revoked or
+        //    retired. That can't let a frame in: step 4 still rejects it.
+        //    Checking the status after the tag means "revoked" and "retired"
+        //    are only ever said about frames made with that key, and a
+        //    forged frame learns nothing about key status.
+        if !frame.verify(&slot.key) {
             return Err(format!("authentication failed for {camera}"));
         }
 
-        // 4. Freshness: above the replay bar, and not a repeat of an
+        // 4. Key status: not revoked, not retired.
+        self.check_key_status(camera, frame.key_id, slot.revoked)?;
+
+        // 5. Freshness: above the replay bar, and not a repeat of an
         //    authentic frame already rejected for its payload.
         if self.replay_floor(camera).is_some_and(|floor| u64::from(frame.seq) <= floor)
             || self.ram.rejected[camera].contains(frame.seq, frame.tag())
@@ -152,7 +162,7 @@ impl Receiver {
             return Err(format!("stale or replayed frame: {camera} seq {}", frame.seq));
         }
 
-        // 5. Payload.
+        // 6. Payload.
         let tree = match tree::decode(frame.payload) {
             Ok(tree) => tree,
             Err(e) => {
@@ -172,7 +182,7 @@ impl Receiver {
             }
         };
 
-        // 6. Timestamp.
+        // 7. Timestamp.
         let (timestamp, corrected) =
             correct_timestamp(self.ram.last[camera], frame.seq, frame.timestamp, &config);
 
@@ -226,13 +236,9 @@ impl Receiver {
         });
     }
 
-    fn usable_key(&self, camera: Camera, key_id: u8) -> Result<&Key, String> {
-        let slot = self
-            .nvs
-            .key(camera, key_id)
-            .ok_or_else(|| format!("{camera} key {key_id} is not provisioned"))?;
-        match self.key_status(camera, key_id, slot.revoked) {
-            KeyStatus::Active => Ok(&slot.key),
+    fn check_key_status(&self, camera: Camera, key_id: u8, revoked: bool) -> Result<(), String> {
+        match self.key_status(camera, key_id, revoked) {
+            KeyStatus::Active => Ok(()),
             KeyStatus::Revoked => Err(format!("{camera} key {key_id} is revoked")),
             KeyStatus::Retired => Err(format!("{camera} key {key_id} is retired")),
         }

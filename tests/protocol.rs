@@ -261,6 +261,36 @@ fn version_2_frames_use_their_key_id() {
 }
 
 #[test]
+fn key_status_is_reported_only_for_frames_made_with_that_key() {
+    let mut rx = Rx::new(no_overrides());
+    rx.add_key("cam1", 1, key(0x40));
+    rx.accept(&frame(1, 1, 0).v2(1, key(0x40)));
+    rx.revoke_key("cam2", 0);
+    let before = rx.state();
+
+    // Forgeries naming a retired or revoked key fail authentication, so a
+    // sender without the key learns nothing about its status.
+    let mut forged_v1 = frame(1, 2, 50);
+    forged_v1.key = key(0x99);
+    assert_eq!(rx.reject(&forged_v1), "authentication failed for cam1");
+    assert_eq!(rx.reject(&frame(1, 2, 50).v2(0, key(0x99))), "authentication failed for cam1");
+    let mut forged_cam2 = frame(2, 1, 0);
+    forged_cam2.key = key(0x99);
+    assert_eq!(rx.reject(&forged_cam2), "authentication failed for cam2");
+
+    // Frames made with the key itself are rejected for its status.
+    assert_eq!(rx.reject(&frame(1, 2, 50)), "cam1 key 0 is retired");
+    assert_eq!(rx.reject(&frame(1, 2, 50).v2(0, cam1_key())), "cam1 key 0 is retired");
+    assert_eq!(rx.reject(&frame(2, 1, 0)), "cam2 key 0 is revoked");
+
+    // Status comes before replay: a stale frame made with a retired key is
+    // reported as retired.
+    assert_eq!(rx.reject(&frame(1, 1, 0)), "cam1 key 0 is retired");
+
+    assert_eq!(rx.state(), before);
+}
+
+#[test]
 fn provisioning_a_key_does_not_retire_older_keys_until_it_is_used() {
     let mut rx = Rx::new(no_overrides());
     rx.add_key("cam1", 1, key(0x40));
