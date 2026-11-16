@@ -219,6 +219,20 @@ and debug assertions are on. A failing input is saved under
 ./fuzz/target/*/release/session fuzz/artifacts/session/crash-<hash>
 ```
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request, on `main`, and weekly:
+
+| Job | What it runs |
+|---|---|
+| Format, lints and tests | the Docker `test` stage, then the runtime image on the spec's example session (one response per command, nothing on stderr) |
+| Dependency advisories | the Docker `audit` stage, against the advisory database as it is at that moment |
+| Fuzz targets | `./fuzz/run.sh`: each target for 60 seconds, keeping any failing input as a build artifact |
+
+The weekly run is there so that a new advisory, or a fuzz failure that takes
+longer to find, shows up without anyone pushing a change. Actions are pinned
+by commit, as the Docker images are by digest.
+
 ## Code layout
 
 | File | Role |
@@ -238,3 +252,4 @@ and debug assertions are on. A failing input is saved under
 | `src/log_writer.rs` | writes events on a separate thread through a bounded queue, so an unread stderr can't stop the receiver |
 | `Dockerfile` | audit, toolchain, test, build and runtime stages, on images pinned by digest; `.dockerignore` sends the build only what it needs |
 | `fuzz/` | fuzz targets and `run.sh`, which builds and runs them |
+| `.github/workflows/ci.yml` | tests, dependency audit and a short fuzz run on every pull request and weekly |
