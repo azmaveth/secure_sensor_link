@@ -14,6 +14,8 @@
 //! - [`response`]: response JSON shapes.
 //! - [`event`]: diagnostics for operators, written to stderr.
 //! - [`diagnostics`]: which of those events are written; none by default.
+//! - [`log_writer`]: where those events go. The binary writes them on a
+//!   separate thread, so a log that isn't being read can't stop the receiver.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
@@ -24,6 +26,7 @@ pub mod diagnostics;
 pub mod event;
 pub mod frame;
 pub mod line_reader;
+pub mod log_writer;
 pub mod nvs;
 pub mod receiver;
 pub mod response;
@@ -35,18 +38,32 @@ use std::panic::{self, AssertUnwindSafe};
 
 use diagnostics::Diagnostics;
 use line_reader::{BoundedLines, Line, MAX_LINE_LEN};
+use log_writer::{EventSink, LineSink};
 use receiver::Receiver;
 use response::Response;
 
 /// Runs the receiver over `input` until end of input, writing one response
 /// line per input line to `output` and flushing after each. The diagnostic
-/// events that `diagnostics` allows go to `log`, one JSON line each; with
-/// [`Diagnostics::Off`] `log` is never written. A failure to write the log
-/// is ignored: diagnostics must never stop the receiver.
+/// events that `diagnostics` allows are written to `log`, one JSON line
+/// each, on this thread; with [`Diagnostics::Off`] `log` is never written.
+/// A failure to write the log is ignored: diagnostics must never stop the
+/// receiver. For a `log` that can block, such as stderr when it is a pipe,
+/// use [`run_with_sink`] and a [`log_writer::BackgroundLog`], as the binary
+/// does.
 pub fn run<R: BufRead, W: Write, L: Write>(
     input: R,
+    output: W,
+    log: L,
+    diagnostics: Diagnostics,
+) -> io::Result<()> {
+    run_with_sink(input, output, LineSink(log), diagnostics)
+}
+
+/// As [`run`], sending the allowed diagnostic events to `sink`.
+pub fn run_with_sink<R: BufRead, W: Write, S: EventSink>(
+    input: R,
     mut output: W,
-    mut log: L,
+    mut sink: S,
     diagnostics: Diagnostics,
 ) -> io::Result<()> {
     let mut lines = BoundedLines::new(input, MAX_LINE_LEN);
@@ -62,15 +79,10 @@ pub fn run<R: BufRead, W: Write, L: Write>(
         };
         writeln!(output, "{}", response.to_json())?;
         output.flush()?;
-        let mut wrote = false;
         for event in receiver.take_events() {
             if diagnostics.allows(&event) {
-                let _ = writeln!(log, "{}", event.to_json());
-                wrote = true;
+                sink.emit(&event);
             }
-        }
-        if wrote {
-            let _ = log.flush();
         }
     }
     Ok(())

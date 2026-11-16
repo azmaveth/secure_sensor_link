@@ -1,0 +1,54 @@
+[package]
+name = "secure-sensor-link-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Coverage-guided fuzz targets (libFuzzer). A package of its own, outside the
+# receiver's manifest, so the receiver's dependency list stays as the spec
+# limits it. Run with ./fuzz/run.sh; see the README.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+hex = "0.4.3"
+libfuzzer-sys = "0.4.13"
+secure-sensor-link = { path = ".." }
+serde_json = "1.0.154"
+
+# Not part of any workspace.
+[workspace]
+
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tree"
+path = "fuzz_targets/tree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lines"
+path = "fuzz_targets/lines.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false
+bench = false

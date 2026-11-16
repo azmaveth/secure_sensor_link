@@ -125,6 +125,20 @@ With the default profile nothing reports a revoked key's leftovers, the last
 key id or an oversized timestamp. A deployment that wants those signals
 should run with `security`.
 
+Events are written to stderr by a separate thread, so the receiver never
+waits on the log. If stderr is not being read (a pipe whose reader has
+stalled), events queue up, and once a queue is full further ones are dropped.
+Responses are never delayed.
+
+- There are two queues of 1,024 lines. The `security` events have one to
+  themselves and are written first. One boot can produce fewer than 520 of
+  them, so no number of tree-size events can push one out; only many
+  restarts while stderr stays blocked could fill that queue.
+- When events are dropped, an `events_dropped` line says how many of each
+  kind, as soon as stderr accepts a line again.
+- At exit the receiver waits up to two seconds for queued events to be
+  written.
+
 | Event | When | Fields |
 |---|---|---|
 | `tree_rejected` | An authentic frame's tree breaks the 1,024-node or depth-64 limit, and its `seq` is higher than any already logged for that camera since the receiver started (so resending recorded frames adds no lines) | `camera`, `key_id`, `seq`, the tree's full `nodes` and `depth`, `limit_nodes`, `limit_depth` |
@@ -132,6 +146,7 @@ should run with `security`.
 | `key_revoked` | A key is revoked (not when it already was) | `camera`, `key_id`, and what the key leaves behind: `discarded` (its queued frames, dropped), `replay_bar` (the seq a frame must now exceed, if a frame from this key set it, else `null`), `set_timeline` (a frame from this key set the camera's timeline since the receiver started), `retired_keys` (unrevoked lower ids that stay retired because this is the highest key the camera has used) |
 | `final_key_id` | Key id 255 is provisioned for a camera, or a camera moves to it | `camera`, `in_use`. Cameras only move forward through their keys, so a camera on 255 can't be re-keyed |
 | `timestamp_beyond_i64` | An accepted frame's corrected timestamp is above 9223372036854775807 for the first time for that camera since the receiver started | `camera`, `key_id`, `seq`, `timestamp`. The value is exact and fits an unsigned 64-bit integer, but not a signed one. No real clock is near it, so the camera's timeline is following a bad timestamp |
+| `events_dropped` | Events could not be written because stderr was not being read, and stderr now accepts lines again | `security` and `other`: how many of each kind were dropped. Written under any profile that is not `off` |
 
 Revoking a key rejects its frames from then on and drops its queued ones. It
 does not undo what earlier frames from that key did: the replay bar, the
@@ -156,12 +171,12 @@ cargo test
 
 | Suite | What it checks |
 |---|---|
-| unit tests in `src/` | frame layout, tree codec and limits, command validation, line reader, pairing, timestamp correction, command-line arguments |
+| unit tests in `src/` | frame layout, tree codec and limits, command validation, line reader, pairing, timestamp correction, command-line arguments, the log writer (order, security events first and never pushed out by others, a blocked or failing stream, dropped counts by kind) |
 | `tests/spec_examples.rs` | all 24 steps of the spec's three example sessions, in-process and through the binary: with no arguments (stderr stays empty) and under each diagnostics profile (stdout unchanged); a bad command line is refused |
 | `tests/protocol.rs` | one rule at a time: replay, tampering, malformed input, correction, sync, key rules, restarts, NVS write budget, oversized lines |
 | `tests/size_logging.rs` | tree-size diagnostics: rejections report the full size, replayed oversized frames are logged once however many are cycled, records are logged once per camera, events go only to the log stream, and a failing log doesn't stop the receiver |
 | `tests/key_events.rs` | key diagnostics: what a revoked key leaves behind (replay bar, timeline, retired keys, dropped frames), before and after a restart, and the last key id |
-| `tests/diagnostics.rs` | diagnostics profiles: each writes its own events and the same responses, the log is never touched when off; the oversized-timestamp event fires once per camera per boot, and every timestamp fits an unsigned 64-bit integer |
+| `tests/diagnostics.rs` | diagnostics profiles: each writes its own events and the same responses, the log is never touched when off; the oversized-timestamp event fires once per camera per boot, and every timestamp fits an unsigned 64-bit integer; the binary keeps answering when nobody reads its stderr |
 | `tests/properties.rs` | property tests: tree round trips, arbitrary bytes and lines never break the receiver, and over random sessions with restarts: restart safety, post-restart liveness, the NVS write budget and the queue bound |
 
 `tests/data/*.jsonl` holds the spec examples as `{"in": …, "out": …}` pairs,
@@ -179,6 +194,62 @@ cargo clippy --all-targets
 cargo fmt --check
 ```
 
+## Fuzzing
+
+Four coverage-guided fuzz targets (libFuzzer) live in `fuzz/`, a package of
+its own so that the receiver's dependencies stay as the spec limits them.
+
+| Target | Input | What must hold |
+|---|---|---|
+| `frame` | arbitrary bytes, as a frame and as hex text | parsing never panics; an accepted frame has exactly the spec's layout |
+| `tree` | arbitrary bytes as a payload | decoding never panics; an accepted tree is within the limits and encodes back to exactly the input; a tree rejected as too large is over a limit |
+| `lines` | arbitrary bytes on stdin after a valid `init` | never panics; one response per line; every response is a well-formed response object |
+| `session` | a session of correctly signed frames, key commands and restarts, steered by the input | a frame is accepted only with the right key, an unrevoked and unretired key id, a valid payload and a seq above every seq ever accepted from that camera, restarts included; queues stay within `max_pending`; replay writes stay within the endurance budget |
+
+Run them all for 60 seconds each, one for longer, or all for longer:
+
+```bash
+./fuzz/run.sh
+```
+
+```bash
+./fuzz/run.sh session 600
+```
+
+```bash
+./fuzz/run.sh all 900
+```
+
+Each run starts from two sets of inputs. `fuzz/seeds/` is committed: the
+spec's example frames, payloads and commands, so a run begins past the tag
+check instead of at the first parse error. `fuzz/corpus/` is where libFuzzer
+keeps every input that reached new code; it is not committed, and a later
+run carries on from it.
+
+This needs only the stable toolchain and a C++ compiler. The script passes
+the coverage flags `cargo-fuzz` would, without a sanitizer: sanitizers need
+a nightly toolchain, and the receiver has no `unsafe` code. Overflow checks
+and debug assertions are on. A failing input is saved under
+`fuzz/artifacts/<target>/`; to replay one:
+
+```bash
+./fuzz/target/*/release/session fuzz/artifacts/session/crash-<hash>
+```
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request, on `main`, and weekly:
+
+| Job | What it runs |
+|---|---|
+| Format, lints and tests | the Docker `test` stage, then the runtime image on the spec's example session (one response per command, nothing on stderr) |
+| Dependency advisories | the Docker `audit` stage, against the advisory database as it is at that moment |
+| Fuzz targets | `./fuzz/run.sh`: each target for 60 seconds on a pull request or a push, and for 15 minutes on the weekly run. The corpus is carried from one run to the next, and any failing input is kept as a build artifact |
+
+The weekly run is there so that a new advisory, or a fuzz failure that takes
+longer to find, shows up without anyone pushing a change. Actions are pinned
+by commit, as the Docker images are by digest.
+
 ## Code layout
 
 | File | Role |
@@ -195,4 +266,7 @@ cargo fmt --check
 | `src/response.rs` | response JSON shapes |
 | `src/event.rs` | diagnostic events written to stderr |
 | `src/diagnostics.rs` | diagnostics profiles (`off`, `security`, `all`) and the `--diagnostics` argument |
+| `src/log_writer.rs` | writes events on a separate thread through two bounded queues, security events first, so an unread stderr can't stop the receiver |
 | `Dockerfile` | audit, toolchain, test, build and runtime stages, on images pinned by digest; `.dockerignore` sends the build only what it needs |
+| `fuzz/` | fuzz targets, their seed inputs, and `run.sh`, which builds and runs them |
+| `.github/workflows/ci.yml` | tests, dependency audit and a short fuzz run on every pull request and weekly |

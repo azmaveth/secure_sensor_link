@@ -119,3 +119,52 @@ fn every_timestamp_fits_an_unsigned_64_bit_integer() {
     assert!(largest <= i128::from(u64::MAX));
     assert_eq!(p["frame"]["timestamp"].as_u64(), Some(largest as u64), "parses as u64");
 }
+
+/// Runs the real binary on `input` without reading its stderr until it has
+/// exited, as if stderr were a pipe that nobody drains. Returns the number
+/// of responses and whatever reached stderr.
+fn run_with_unread_stderr(profile: &str, input: String) -> (usize, String) {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_receiver"))
+        .args(["--diagnostics", profile])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let feeder = std::thread::spawn(move || {
+        // If the receiver stopped reading, this write would never finish.
+        stdin.write_all(input.as_bytes()).unwrap();
+    });
+    let mut stdout = String::new();
+    child.stdout.take().unwrap().read_to_string(&mut stdout).unwrap();
+    feeder.join().unwrap();
+    assert!(child.wait().unwrap().success());
+    let mut stderr = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    (stdout.lines().count(), stderr)
+}
+
+#[test]
+fn a_log_that_nobody_reads_does_not_stop_the_receiver() {
+    // 3,000 oversized trees with rising seqs: one `tree_rejected` event
+    // each, several times what a pipe holds. Written straight to stderr,
+    // the receiver would block part-way and this test would hang.
+    let frames = 3000;
+    let tree = T::spine(70);
+    let mut input = init_command(json!({}));
+    for seq in 1..=frames {
+        input.push('\n');
+        input.push_str(&receive_command(&frame(1, seq, 0).tree(&tree).hex()));
+    }
+    let (responses, stderr) = run_with_unread_stderr("all", input);
+    assert_eq!(responses, frames as usize + 1, "every command was answered");
+
+    // Some events were written and the rest dropped; none was half-written.
+    let events = stderr.lines().count();
+    assert!(events > 0 && events < frames as usize, "{events} events");
+    assert!(stderr.lines().all(|l| serde_json::from_str::<Value>(l).is_ok()));
+}

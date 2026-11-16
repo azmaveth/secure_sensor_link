@@ -1,0 +1,97 @@
+# Runs the same checks a developer runs by hand, on every pull request and
+# on main, and once a week so that a new advisory or a slow-to-find fuzz
+# crash shows up without anyone pushing a change.
+#
+# Actions are pinned by commit, like the Docker images are pinned by digest:
+# a tag can be moved, a commit can't.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Mondays, 06:17 UTC.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Format, lints and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # cargo fmt --check, clippy -D warnings and the full test suite, on the
+      # pinned toolchain image.
+      - name: Test stage
+        run: docker build --target test --progress=plain .
+      - name: Runtime image answers the spec's example session
+        run: |
+          docker build -t secure-sensor-link .
+          docker run --rm -i secure-sensor-link < examples/spec_session.jsonl > responses.jsonl 2> stderr.txt
+          test "$(wc -l < responses.jsonl)" -eq "$(wc -l < examples/spec_session.jsonl)"
+          test ! -s stderr.txt
+
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # RERUN changes on every run, so the check is always made against the
+      # advisory database as it is now.
+      - name: cargo audit
+        run: >
+          docker build --target audit --progress=plain
+          --build-arg RERUN=${{ github.run_id }}-${{ github.run_attempt }} .
+
+  fuzz:
+    name: Fuzz targets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      # A minute per target on a pull request or a push, so the check stays
+      # quick; fifteen on the weekly run and when started by hand.
+      FUZZ_SECONDS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '900' || '60' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The same Rust version as the Docker toolchain image. libFuzzer is
+      # built from source and needs a C++ compiler, which the runner has.
+      - name: Toolchain
+        run: |
+          rustup toolchain install 1.99 --profile minimal --no-self-update
+          rustup default 1.99
+      # Each run starts from the inputs earlier runs found and saves what it
+      # adds, so coverage builds up over time instead of starting over. The
+      # key is unique per run, so the newest corpus is always the one
+      # restored. The committed seeds are read as well, whatever the cache
+      # holds.
+      - name: Restore the corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-
+      - name: Fuzz each target
+        run: ./fuzz/run.sh all "$FUZZ_SECONDS"
+      - name: Keep crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
