@@ -125,6 +125,13 @@ With the default profile nothing reports a revoked key's leftovers, the last
 key id or an oversized timestamp. A deployment that wants those signals
 should run with `security`.
 
+Events are written to stderr by a separate thread, through a queue of 1,024
+lines. If stderr is not being read (a pipe whose reader has stalled), the
+queue fills and further events are dropped rather than making the receiver
+wait; an `events_dropped` line gives the count once stderr accepts lines
+again. Responses are never delayed by the log. At exit the receiver waits up
+to two seconds for queued events to be written.
+
 | Event | When | Fields |
 |---|---|---|
 | `tree_rejected` | An authentic frame's tree breaks the 1,024-node or depth-64 limit, and its `seq` is higher than any already logged for that camera since the receiver started (so resending recorded frames adds no lines) | `camera`, `key_id`, `seq`, the tree's full `nodes` and `depth`, `limit_nodes`, `limit_depth` |
@@ -132,6 +139,7 @@ should run with `security`.
 | `key_revoked` | A key is revoked (not when it already was) | `camera`, `key_id`, and what the key leaves behind: `discarded` (its queued frames, dropped), `replay_bar` (the seq a frame must now exceed, if a frame from this key set it, else `null`), `set_timeline` (a frame from this key set the camera's timeline since the receiver started), `retired_keys` (unrevoked lower ids that stay retired because this is the highest key the camera has used) |
 | `final_key_id` | Key id 255 is provisioned for a camera, or a camera moves to it | `camera`, `in_use`. Cameras only move forward through their keys, so a camera on 255 can't be re-keyed |
 | `timestamp_beyond_i64` | An accepted frame's corrected timestamp is above 9223372036854775807 for the first time for that camera since the receiver started | `camera`, `key_id`, `seq`, `timestamp`. The value is exact and fits an unsigned 64-bit integer, but not a signed one. No real clock is near it, so the camera's timeline is following a bad timestamp |
+| `events_dropped` | Events could not be written because stderr was not being read, and stderr now accepts lines again | `count`: how many were dropped. Written under any profile that is not `off` |
 
 Revoking a key rejects its frames from then on and drops its queued ones. It
 does not undo what earlier frames from that key did: the replay bar, the
@@ -156,12 +164,12 @@ cargo test
 
 | Suite | What it checks |
 |---|---|
-| unit tests in `src/` | frame layout, tree codec and limits, command validation, line reader, pairing, timestamp correction, command-line arguments |
+| unit tests in `src/` | frame layout, tree codec and limits, command validation, line reader, pairing, timestamp correction, command-line arguments, the log writer (order, a blocked or failing stream, dropped-line counts) |
 | `tests/spec_examples.rs` | all 24 steps of the spec's three example sessions, in-process and through the binary: with no arguments (stderr stays empty) and under each diagnostics profile (stdout unchanged); a bad command line is refused |
 | `tests/protocol.rs` | one rule at a time: replay, tampering, malformed input, correction, sync, key rules, restarts, NVS write budget, oversized lines |
 | `tests/size_logging.rs` | tree-size diagnostics: rejections report the full size, replayed oversized frames are logged once however many are cycled, records are logged once per camera, events go only to the log stream, and a failing log doesn't stop the receiver |
 | `tests/key_events.rs` | key diagnostics: what a revoked key leaves behind (replay bar, timeline, retired keys, dropped frames), before and after a restart, and the last key id |
-| `tests/diagnostics.rs` | diagnostics profiles: each writes its own events and the same responses, the log is never touched when off; the oversized-timestamp event fires once per camera per boot, and every timestamp fits an unsigned 64-bit integer |
+| `tests/diagnostics.rs` | diagnostics profiles: each writes its own events and the same responses, the log is never touched when off; the oversized-timestamp event fires once per camera per boot, and every timestamp fits an unsigned 64-bit integer; the binary keeps answering when nobody reads its stderr |
 | `tests/properties.rs` | property tests: tree round trips, arbitrary bytes and lines never break the receiver, and over random sessions with restarts: restart safety, post-restart liveness, the NVS write budget and the queue bound |
 
 `tests/data/*.jsonl` holds the spec examples as `{"in": …, "out": …}` pairs,
@@ -195,4 +203,5 @@ cargo fmt --check
 | `src/response.rs` | response JSON shapes |
 | `src/event.rs` | diagnostic events written to stderr |
 | `src/diagnostics.rs` | diagnostics profiles (`off`, `security`, `all`) and the `--diagnostics` argument |
+| `src/log_writer.rs` | writes events on a separate thread through a bounded queue, so an unread stderr can't stop the receiver |
 | `Dockerfile` | audit, toolchain, test, build and runtime stages, on images pinned by digest; `.dockerignore` sends the build only what it needs |

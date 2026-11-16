@@ -14,6 +14,8 @@
 //! - [`response`]: response JSON shapes.
 //! - [`event`]: diagnostics for operators, written to stderr.
 //! - [`diagnostics`]: which of those events are written; none by default.
+//! - [`log_writer`]: writes them on a separate thread, so a log that isn't
+//!   being read can't stop the receiver.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
@@ -24,6 +26,7 @@ pub mod diagnostics;
 pub mod event;
 pub mod frame;
 pub mod line_reader;
+pub mod log_writer;
 pub mod nvs;
 pub mod receiver;
 pub mod response;
@@ -42,7 +45,9 @@ use response::Response;
 /// line per input line to `output` and flushing after each. The diagnostic
 /// events that `diagnostics` allows go to `log`, one JSON line each; with
 /// [`Diagnostics::Off`] `log` is never written. A failure to write the log
-/// is ignored: diagnostics must never stop the receiver.
+/// is ignored: diagnostics must never stop the receiver. A `log` that can
+/// block (stderr, when it is a pipe) should be wrapped in a
+/// [`log_writer::BackgroundLog`], as the binary does.
 pub fn run<R: BufRead, W: Write, L: Write>(
     input: R,
     mut output: W,

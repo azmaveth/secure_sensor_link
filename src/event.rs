@@ -68,6 +68,11 @@ pub enum Event {
     /// timestamps as signed 64-bit will not cope. No real clock is near that
     /// value, so it also means the camera's timeline follows a bad timestamp.
     TimestampBeyondI64 { camera: &'static str, key_id: u8, seq: u32, timestamp: i128 },
+    /// `count` events could not be written because the log stream was not
+    /// being read fast enough, and were dropped so that the receiver would
+    /// not have to wait for it. Written by [`crate::log_writer`] once the
+    /// stream accepts lines again, whatever the profile.
+    EventsDropped { count: u64 },
 }
 
 impl Event {
@@ -76,7 +81,10 @@ impl Event {
     /// writes only these.
     pub fn is_security(&self) -> bool {
         match self {
-            Event::KeyRevoked { .. } | Event::FinalKeyId { .. } | Event::TimestampBeyondI64 { .. } => true,
+            Event::KeyRevoked { .. }
+            | Event::FinalKeyId { .. }
+            | Event::TimestampBeyondI64 { .. }
+            | Event::EventsDropped { .. } => true,
             Event::TreeRejected { .. } | Event::TreeSizeRecord { .. } => false,
         }
     }
