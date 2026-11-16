@@ -20,6 +20,19 @@ Run the formatting check, clippy and the full test suite:
 docker build --target test --progress=plain .
 ```
 
+Check the dependencies against the RustSec advisory database with
+`cargo audit` (this one needs network access during the build):
+
+```bash
+docker build --target audit --build-arg RERUN=$(date +%s) --progress=plain .
+```
+
+The build fails on a known vulnerability, and on an unmaintained, unsound or
+yanked crate. `RERUN` makes Docker run the check again instead of reusing an
+earlier result, so it is always against today's advisories. It is separate
+from the test stage so that a new advisory can't fail a test run for code
+that hasn't changed.
+
 Build the runtime image, then run the spec's example sessions through it:
 
 ```bash
@@ -33,11 +46,20 @@ docker run --rm -i secure-sensor-link < examples/spec_session.jsonl
 Keep `-i`: the receiver reads its commands from stdin. Responses go to
 stdout and diagnostics to stderr, as below.
 
-- The image pins Rust 1.99, the version the project is tested with. To check
-  the minimum supported version instead:
+- Every image in the `Dockerfile` (the Rust toolchain, the Debian runtime
+  base and the Dockerfile frontend) is pinned by digest, so a tag that is
+  moved upstream can't change what gets built. To update one, look up the
+  tag's current digest and replace it in the `Dockerfile`:
 
   ```bash
-  docker build --target test --build-arg RUST_VERSION=1.88 --progress=plain .
+  docker buildx imagetools inspect rust:1.99-slim-trixie
+  ```
+
+- The toolchain image is Rust 1.99, the version the project is tested with.
+  To check the minimum supported version instead:
+
+  ```bash
+  docker build --target test --build-arg RUST_IMAGE=rust:1.88-slim-trixie --progress=plain .
   ```
 
 - Docker caches the test step like any other, so it won't run again if
@@ -136,4 +158,4 @@ cargo fmt --check
 | `src/nvs.rs` | simulated non-volatile store; counts writes |
 | `src/response.rs` | response JSON shapes |
 | `src/event.rs` | diagnostic events written to stderr |
-| `Dockerfile` | toolchain, test, build and runtime stages; `.dockerignore` sends the build only what it needs |
+| `Dockerfile` | audit, toolchain, test, build and runtime stages, on images pinned by digest; `.dockerignore` sends the build only what it needs |
