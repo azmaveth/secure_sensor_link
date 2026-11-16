@@ -3,14 +3,15 @@
 //! State is split by what survives a restart: [`Nvs`] does, [`Ram`] does not.
 //! Every command validates fully before it changes anything, so a command
 //! that returns an error leaves the receiver as it was. The one exception is
-//! [`RejectedFrames`]: an authentic frame rejected for its payload is
-//! remembered so that exact repeats are recognised as replays. That never
-//! changes which frames are accepted.
+//! an authentic frame rejected for its payload: it is remembered
+//! ([`RejectedFrames`]) so that exact repeats are recognised as replays, and
+//! so is the highest seq logged as oversized. Neither changes which frames
+//! are accepted.
 
 use crate::camera::{Camera, PerCamera};
 use crate::command::{self, Command, Config};
 use crate::event::Event;
-use crate::frame::{self, Frame, Key, TAG_LEN};
+use crate::frame::{self, Frame, KEY_LEN, Key, TAG_LEN};
 use crate::nvs::Nvs;
 use crate::response::{
     CameraView, CamerasView, FrameView, KeyStatus, KeyView, Payload, ReceiveView, Response, StateView,
@@ -19,6 +20,13 @@ use crate::sync::{Pending, Synchronizer};
 use crate::tree::{self, MAX_DEPTH, MAX_NODES, Shape, TreeError};
 
 const NOT_INITIALIZED: &str = "receiver is not initialized: the first command must be init";
+
+/// Stands in for the key of an id that isn't provisioned, so that a frame
+/// naming one costs the same tag computation as any other forgery.
+const NO_KEY: Key = [0; KEY_LEN];
+
+/// The highest key id. A camera that reaches it can't be re-keyed again.
+const FINAL_KEY_ID: u8 = u8::MAX;
 
 /// Volatile state, wiped by a restart.
 #[derive(Debug, Default, Clone)]
@@ -30,12 +38,25 @@ struct Ram {
     /// The two maxima may come from different frames.
     largest_tree: PerCamera<Shape>,
     rejected: PerCamera<RejectedFrames>,
+    /// Highest seq for which a `tree_rejected` event was logged since boot.
+    /// Only a higher seq is logged, so resending recorded frames, in any
+    /// number and order, can't add log lines.
+    rejection_logged: PerCamera<Option<u32>>,
+    /// Ids of the keys whose frames set the camera's timeline since boot: the
+    /// first frame, and every frame whose own timestamp was kept. A corrected
+    /// frame takes its timestamp from the timeline, so it doesn't count.
+    /// Ascending, because cameras only move forward through their keys.
+    timeline_keys: PerCamera<Vec<u8>>,
+    /// Whether a timestamp above `i64::MAX` has been logged since boot.
+    beyond_i64_logged: PerCamera<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Last {
     seq: u32,
     timestamp: i128,
+    /// The key that authenticated the frame.
+    key_id: u8,
 }
 
 /// How many rejected frames each camera remembers.
@@ -136,11 +157,14 @@ impl Receiver {
         let frame = frame::parse(&bytes).map_err(|e| e.to_string())?;
         let camera = frame.camera;
 
-        // 2. Key: the camera has a key with this id.
-        let slot = self
-            .nvs
-            .key(camera, frame.key_id)
-            .ok_or_else(|| format!("{camera} key {} is not provisioned", frame.key_id))?;
+        // 2. Key: the camera has a key with this id. If it doesn't, the
+        //    frame gets the same answer as one with a wrong tag, after the
+        //    same tag computation, so a sender without a key can't find out
+        //    which ids are provisioned.
+        let Some(slot) = self.nvs.key(camera, frame.key_id) else {
+            std::hint::black_box(frame.verify(&NO_KEY));
+            return Err(format!("authentication failed for {camera}"));
+        };
 
         // 3. Authenticity, with the stored key even if it is revoked or
         //    retired. That can't let a frame in: step 4 still rejects it.
@@ -167,7 +191,10 @@ impl Receiver {
             Ok(tree) => tree,
             Err(e) => {
                 self.ram.rejected[camera].insert(frame.seq, frame.tag());
-                if let TreeError::TooLarge(shape) = e {
+                if let TreeError::TooLarge(shape) = e
+                    && self.ram.rejection_logged[camera].is_none_or(|logged| frame.seq > logged)
+                {
+                    self.ram.rejection_logged[camera] = Some(frame.seq);
                     self.events.push(Event::TreeRejected {
                         camera: camera.name(),
                         key_id: frame.key_id,
@@ -187,11 +214,26 @@ impl Receiver {
             correct_timestamp(self.ram.last[camera], frame.seq, frame.timestamp, &config);
 
         // Accept. Nothing below can fail.
-        self.reserve_replay_window(camera, frame.seq, config.persist_interval);
+        self.reserve_replay_window(camera, frame.seq, frame.key_id, config.persist_interval);
         if frame.key_id > self.nvs.current_key(camera) {
             self.nvs.write_current_key(camera, frame.key_id);
+            if frame.key_id == FINAL_KEY_ID {
+                self.events.push(Event::FinalKeyId { camera: camera.name(), in_use: true });
+            }
         }
-        self.ram.last[camera] = Some(Last { seq: frame.seq, timestamp });
+        if !corrected && self.ram.timeline_keys[camera].last() != Some(&frame.key_id) {
+            self.ram.timeline_keys[camera].push(frame.key_id);
+        }
+        if timestamp > i128::from(i64::MAX) && !self.ram.beyond_i64_logged[camera] {
+            self.ram.beyond_i64_logged[camera] = true;
+            self.events.push(Event::TimestampBeyondI64 {
+                camera: camera.name(),
+                key_id: frame.key_id,
+                seq: frame.seq,
+                timestamp,
+            });
+        }
+        self.ram.last[camera] = Some(Last { seq: frame.seq, timestamp, key_id: frame.key_id });
         self.ram.rejected[camera].forget_through(frame.seq);
         self.note_tree_size(&frame, tree.shape());
         let synced = self.ram.sync.push(
@@ -268,11 +310,13 @@ impl Receiver {
     /// rewritten only when an accepted seq passes it, and then set
     /// `persist_interval` ahead, so writes happen at seqs more than
     /// `persist_interval` apart and the floor never exceeds the highest
-    /// accepted seq by more than `persist_interval`.
-    fn reserve_replay_window(&mut self, camera: Camera, seq: u32, persist_interval: u32) {
+    /// accepted seq by more than `persist_interval`. The same write records
+    /// which key authenticated the frame, so a later revocation can say
+    /// whether the floor came from the revoked key.
+    fn reserve_replay_window(&mut self, camera: Camera, seq: u32, key_id: u8, persist_interval: u32) {
         let seq = u64::from(seq);
         if self.nvs.replay_floor(camera).is_none_or(|floor| seq > floor) {
-            self.nvs.write_replay_floor(camera, seq + u64::from(persist_interval));
+            self.nvs.write_replay_floor(camera, seq + u64::from(persist_interval), key_id);
         }
     }
 
@@ -292,7 +336,19 @@ impl Receiver {
                     self.nvs.current_key(camera)
                 ));
             }
-            None => self.nvs.write_key(camera, key_id, key),
+            None => {
+                // Whoever holds a revoked key still holds it under a new id,
+                // or for the other camera.
+                if let Some((owner, id)) = self.nvs.revoked_as(&key) {
+                    return Err(format!(
+                        "this key was revoked as {owner} key {id} and cannot be provisioned again"
+                    ));
+                }
+                self.nvs.write_key(camera, key_id, key);
+                if key_id == FINAL_KEY_ID {
+                    self.events.push(Event::FinalKeyId { camera: camera.name(), in_use: false });
+                }
+            }
         }
         Ok(self.state())
     }
@@ -305,9 +361,44 @@ impl Receiver {
         if !slot.revoked {
             self.nvs.write_revocation(camera, key_id);
             // Frames this key authenticated are no longer trusted.
-            self.ram.sync.discard_key(camera, key_id);
+            let discarded = self.ram.sync.discard_key(camera, key_id);
+            let event = self.revocation_event(camera, key_id, discarded);
+            self.events.push(event);
         }
         Ok(self.state())
+    }
+
+    /// Describes what a just-revoked key leaves behind. Revocation rejects
+    /// the key's frames from now on and drops its queued ones, but frames it
+    /// authenticated earlier have already moved the replay bar, set the
+    /// timeline and retired lower keys, and none of that is rolled back. The
+    /// event says which of those the key did, so the operator can decide
+    /// whether the camera's state can still be trusted.
+    fn revocation_event(&self, camera: Camera, key_id: u8, discarded: usize) -> Event {
+        let replay_bar = match self.ram.last[camera] {
+            Some(last) => (last.key_id == key_id).then_some(u64::from(last.seq)),
+            // Nothing accepted since boot: the bar is the persisted floor.
+            None => {
+                self.nvs.replay_floor(camera).filter(|_| self.nvs.replay_floor_key(camera) == Some(key_id))
+            }
+        };
+        let retired_keys = if key_id == self.nvs.current_key(camera) {
+            self.nvs
+                .keys(camera)
+                .filter(|(id, slot)| *id < key_id && !slot.revoked)
+                .map(|(id, _)| id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Event::KeyRevoked {
+            camera: camera.name(),
+            key_id,
+            discarded,
+            replay_bar,
+            set_timeline: self.ram.timeline_keys[camera].contains(&key_id),
+            retired_keys,
+        }
     }
 
     fn state(&self) -> Payload {
@@ -401,7 +492,7 @@ mod tests {
 
     #[test]
     fn jitter_bound_is_inclusive() {
-        let last = Some(Last { seq: 1, timestamp: 1000 });
+        let last = Some(Last { seq: 1, timestamp: 1000, key_id: 0 });
         assert_eq!(correct_timestamp(last, 2, 1055, &config()), (1055, false));
         assert_eq!(correct_timestamp(last, 2, 1045, &config()), (1045, false));
         assert_eq!(correct_timestamp(last, 2, 1056, &config()), (1050, true));
@@ -411,7 +502,7 @@ mod tests {
     #[test]
     fn correction_is_exact_beyond_i64() {
         let config = Config { period_ms: 60_000, max_jitter_ms: 0, ..config() };
-        let last = Some(Last { seq: 0, timestamp: i128::from(i64::MAX) });
+        let last = Some(Last { seq: 0, timestamp: i128::from(i64::MAX), key_id: 0 });
         let (ts, corrected) = correct_timestamp(last, u32::MAX, 0, &config);
         assert!(corrected);
         assert_eq!(ts, i128::from(i64::MAX) + i128::from(u32::MAX) * 60_000);

@@ -6,6 +6,7 @@
 #   docker build --target audit --progress=plain .     known vulnerabilities in dependencies
 #   docker build -t secure-sensor-link .                the runtime image
 #   docker run --rm -i secure-sensor-link < examples/spec_session.jsonl
+#   docker run --rm -i secure-sensor-link --diagnostics security < ...   with diagnostics
 #
 # Downloaded crates and compiled dependencies are kept in BuildKit cache
 # mounts, so a rebuild after a source change only recompiles this crate.
@@ -99,7 +100,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Only the binary, on the same Debian release as the toolchain image (so the
 # glibc matches), running as an unprivileged user. Commands arrive on stdin,
-# so run it with `docker run -i`. Diagnostics go to stderr. This is the last
+# so run it with `docker run -i`. Diagnostics go to stderr, and only when a
+# profile is given after the image name (--diagnostics security). This is the last
 # stage, so it is what a build without --target produces.
 FROM ${RUNTIME_IMAGE} AS runtime
 COPY --from=build /usr/local/bin/receiver /usr/local/bin/receiver

@@ -24,6 +24,9 @@ struct CameraRecord {
     /// After a restart, frames with `seq <= replay_floor` are rejected.
     /// Wider than `u32` because `seq + persist_interval` can exceed it.
     replay_floor: Option<u64>,
+    /// The key that authenticated the frame `replay_floor` was written for.
+    /// Stored in the same write. Meaningful only while there is a floor.
+    replay_floor_key: u8,
 }
 
 /// Write counters, for checking the endurance budget.
@@ -63,6 +66,19 @@ impl Nvs {
         self.cameras[camera].replay_floor
     }
 
+    /// The key whose frame the replay floor was written for, if there is a floor.
+    pub fn replay_floor_key(&self, camera: Camera) -> Option<u8> {
+        let record = &self.cameras[camera];
+        record.replay_floor.map(|_| record.replay_floor_key)
+    }
+
+    /// The camera and id under which exactly this key was revoked, if it was.
+    pub fn revoked_as(&self, key: &Key) -> Option<(Camera, u8)> {
+        Camera::ALL.into_iter().find_map(|camera| {
+            self.keys(camera).find(|(_, slot)| slot.revoked && slot.key == *key).map(|(id, _)| (camera, id))
+        })
+    }
+
     pub fn writes(&self, camera: Camera) -> WriteCounts {
         self.writes[camera]
     }
@@ -92,8 +108,10 @@ impl Nvs {
         self.writes[camera].keys += 1;
     }
 
-    pub fn write_replay_floor(&mut self, camera: Camera, floor: u64) {
+    /// One write: the floor and the key of the frame it was written for.
+    pub fn write_replay_floor(&mut self, camera: Camera, floor: u64, key_id: u8) {
         self.cameras[camera].replay_floor = Some(floor);
+        self.cameras[camera].replay_floor_key = key_id;
         self.writes[camera].replay += 1;
     }
 }

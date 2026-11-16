@@ -44,7 +44,12 @@ docker run --rm -i secure-sensor-link < examples/spec_session.jsonl
 ```
 
 Keep `-i`: the receiver reads its commands from stdin. Responses go to
-stdout and diagnostics to stderr, as below.
+stdout. Diagnostics are off unless asked for; to turn them on, add the
+profile after the image name (see [Diagnostics on stderr](#diagnostics-on-stderr)):
+
+```bash
+docker run --rm -i secure-sensor-link --diagnostics security < examples/spec_session.jsonl
+```
 
 - Every image in the `Dockerfile` (the Rust toolchain, the Debian runtime
   base and the Dockerfile frontend) is pinned by digest, so a tag that is
@@ -97,18 +102,47 @@ Or type commands interactively. Each line gets exactly one response line:
 
 ### Diagnostics on stderr
 
-Stdout carries only the responses, one per command. Diagnostic events go to
-stderr, one JSON object per line:
+Stdout carries only the responses, one per command. Diagnostic events are
+separate: they go to stderr, one JSON object per line, and only if a
+diagnostics profile turns them on. The profile is chosen when the receiver
+starts and never affects a response.
+
+| Profile | Writes | Meant for |
+|---|---|---|
+| `off` (default) | nothing | running exactly as the spec describes |
+| `security` | `key_revoked`, `final_key_id`, `timestamp_beyond_i64` | deployment: the events that say whether a camera's state can still be trusted. Each is caused by a key-management command or happens at most once per camera per boot, so link traffic can't make them a stream of log lines |
+| `all` | every event | bench and integration work: adds the tree-size events |
+
+```bash
+./target/release/receiver --diagnostics security < examples/spec_session.jsonl
+```
+
+`--diagnostics=security` works too, and `--help` lists the profiles. An
+unknown profile or argument stops the receiver before it reads any input,
+with exit status 2.
+
+With the default profile nothing reports a revoked key's leftovers, the last
+key id or an oversized timestamp. A deployment that wants those signals
+should run with `security`.
 
 | Event | When | Fields |
 |---|---|---|
-| `tree_rejected` | An authentic frame's tree breaks the 1,024-node or depth-64 limit | `camera`, `key_id`, `seq`, the tree's full `nodes` and `depth`, `limit_nodes`, `limit_depth` |
+| `tree_rejected` | An authentic frame's tree breaks the 1,024-node or depth-64 limit, and its `seq` is higher than any already logged for that camera since the receiver started (so resending recorded frames adds no lines) | `camera`, `key_id`, `seq`, the tree's full `nodes` and `depth`, `limit_nodes`, `limit_depth` |
 | `tree_size_record` | An accepted tree has more nodes, or more depth, than any earlier tree from that camera since the receiver started | `camera`, `key_id`, `seq`, the tree's `nodes` and `depth`, and the camera's `max_nodes_seen` and `max_depth_seen` |
+| `key_revoked` | A key is revoked (not when it already was) | `camera`, `key_id`, and what the key leaves behind: `discarded` (its queued frames, dropped), `replay_bar` (the seq a frame must now exceed, if a frame from this key set it, else `null`), `set_timeline` (a frame from this key set the camera's timeline since the receiver started), `retired_keys` (unrevoked lower ids that stay retired because this is the highest key the camera has used) |
+| `final_key_id` | Key id 255 is provisioned for a camera, or a camera moves to it | `camera`, `in_use`. Cameras only move forward through their keys, so a camera on 255 can't be re-keyed |
+| `timestamp_beyond_i64` | An accepted frame's corrected timestamp is above 9223372036854775807 for the first time for that camera since the receiver started | `camera`, `key_id`, `seq`, `timestamp`. The value is exact and fits an unsigned 64-bit integer, but not a signed one. No real clock is near it, so the camera's timeline is following a bad timestamp |
+
+Revoking a key rejects its frames from then on and drops its queued ones. It
+does not undo what earlier frames from that key did: the replay bar, the
+timeline and the retirement of lower keys stay as they are. `key_revoked`
+reports which of those the key touched. A `replay_bar` near 4294967295 means
+the camera can no longer be accepted.
 
 To keep them in a file:
 
 ```bash
-./target/release/receiver < examples/spec_session.jsonl 2> receiver.log
+./target/release/receiver --diagnostics all < examples/spec_session.jsonl 2> receiver.log
 ```
 
 Events carry no timestamps (the receiver has no wall clock), so whatever
@@ -122,10 +156,12 @@ cargo test
 
 | Suite | What it checks |
 |---|---|
-| unit tests in `src/` | frame layout, tree codec and limits, command validation, line reader, pairing, timestamp correction |
-| `tests/spec_examples.rs` | all 24 steps of the spec's three example sessions, in-process and through the binary |
+| unit tests in `src/` | frame layout, tree codec and limits, command validation, line reader, pairing, timestamp correction, command-line arguments |
+| `tests/spec_examples.rs` | all 24 steps of the spec's three example sessions, in-process and through the binary: with no arguments (stderr stays empty) and under each diagnostics profile (stdout unchanged); a bad command line is refused |
 | `tests/protocol.rs` | one rule at a time: replay, tampering, malformed input, correction, sync, key rules, restarts, NVS write budget, oversized lines |
-| `tests/size_logging.rs` | tree-size diagnostics: rejections report the full size, a replayed oversized frame is logged once, records are logged once per camera, events go only to the log stream, and a failing log doesn't stop the receiver |
+| `tests/size_logging.rs` | tree-size diagnostics: rejections report the full size, replayed oversized frames are logged once however many are cycled, records are logged once per camera, events go only to the log stream, and a failing log doesn't stop the receiver |
+| `tests/key_events.rs` | key diagnostics: what a revoked key leaves behind (replay bar, timeline, retired keys, dropped frames), before and after a restart, and the last key id |
+| `tests/diagnostics.rs` | diagnostics profiles: each writes its own events and the same responses, the log is never touched when off; the oversized-timestamp event fires once per camera per boot, and every timestamp fits an unsigned 64-bit integer |
 | `tests/properties.rs` | property tests: tree round trips, arbitrary bytes and lines never break the receiver, and over random sessions with restarts: restart safety, post-restart liveness, the NVS write budget and the queue bound |
 
 `tests/data/*.jsonl` holds the spec examples as `{"in": …, "out": …}` pairs,
@@ -147,7 +183,7 @@ cargo fmt --check
 
 | File | Role |
 |---|---|
-| `src/main.rs` | binary entry point: stdin → `run` → stdout |
+| `src/main.rs` | binary entry point: arguments, then stdin → `run` → stdout |
 | `src/lib.rs` | `run`: the line loop, one response per line |
 | `src/line_reader.rs` | reads lines with a hard length cap |
 | `src/command.rs` | parses and range-checks a JSON command into `Command` |
@@ -158,4 +194,5 @@ cargo fmt --check
 | `src/nvs.rs` | simulated non-volatile store; counts writes |
 | `src/response.rs` | response JSON shapes |
 | `src/event.rs` | diagnostic events written to stderr |
+| `src/diagnostics.rs` | diagnostics profiles (`off`, `security`, `all`) and the `--diagnostics` argument |
 | `Dockerfile` | audit, toolchain, test, build and runtime stages, on images pinned by digest; `.dockerignore` sends the build only what it needs |

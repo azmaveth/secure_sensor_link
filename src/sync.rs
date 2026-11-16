@@ -91,9 +91,11 @@ impl Synchronizer {
     }
 
     /// Drops, without emitting, every queued frame from `camera` that was
-    /// authenticated with `key_id`.
-    pub fn discard_key(&mut self, camera: Camera, key_id: u8) {
+    /// authenticated with `key_id`, and returns how many there were.
+    pub fn discard_key(&mut self, camera: Camera, key_id: u8) -> usize {
+        let before = self.queues[camera].len();
         self.queues[camera].retain(|p| p.key_id != key_id);
+        before - self.queues[camera].len()
     }
 }
 
@@ -145,7 +147,8 @@ mod tests {
         let mut s = Synchronizer::default();
         s.push(Camera::Cam1, Pending { seq: 1, timestamp: 0, key_id: 0 }, 0, 4);
         s.push(Camera::Cam1, Pending { seq: 2, timestamp: 50, key_id: 1 }, 0, 4);
-        s.discard_key(Camera::Cam1, 0);
+        assert_eq!(s.discard_key(Camera::Cam1, 0), 1);
         assert_eq!(s.pending(Camera::Cam1), vec![2]);
+        assert_eq!(s.discard_key(Camera::Cam1, 0), 0);
     }
 }

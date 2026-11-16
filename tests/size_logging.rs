@@ -7,6 +7,7 @@ mod common;
 use std::io;
 
 use common::*;
+use secure_sensor_link::diagnostics::Diagnostics;
 use secure_sensor_link::event::Event;
 use serde_json::{Value, json};
 
@@ -99,6 +100,31 @@ fn a_replayed_oversized_frame_is_logged_once() {
 }
 
 #[test]
+fn cycling_through_recorded_oversized_frames_adds_no_log_lines() {
+    let mut rx = Rx::new(json!({}));
+    // More recordings than the receiver remembers by tag, so some of the
+    // repeats are parsed again. None of them is logged again.
+    let recorded: Vec<F> = (1..=20).map(|seq| frame(1, seq, 0).tree(&T::spine(70))).collect();
+    for f in &recorded {
+        rx.reject(f);
+    }
+    assert_eq!(rx.receiver.take_events().len(), 20, "each is logged when it first arrives");
+    for _ in 0..10 {
+        for f in recorded.iter().chain(recorded.iter().rev()) {
+            rx.reject(f);
+        }
+    }
+    assert_eq!(rx.receiver.take_events(), vec![]);
+
+    // A new oversized frame with a higher seq is still logged.
+    rx.reject(&frame(1, 21, 0).tree(&T::spine(70)));
+    assert_eq!(rx.receiver.take_events(), vec![rejected("cam1", 21, 70, 70)]);
+    // Each camera has its own mark.
+    rx.reject(&frame(2, 3, 0).tree(&T::spine(70)));
+    assert_eq!(rx.receiver.take_events(), vec![rejected("cam2", 3, 70, 70)]);
+}
+
+#[test]
 fn records_start_over_after_a_restart() {
     let mut rx = Rx::new(json!({}));
     assert_eq!(accept_tree(&mut rx, 1, 1, &T::leaf(0)).len(), 1);
@@ -124,7 +150,7 @@ fn session() -> Vec<u8> {
 #[test]
 fn run_writes_events_to_the_log_and_only_responses_to_output() {
     let (mut out, mut log) = (Vec::new(), Vec::new());
-    secure_sensor_link::run(session().as_slice(), &mut out, &mut log).unwrap();
+    secure_sensor_link::run(session().as_slice(), &mut out, &mut log, Diagnostics::All).unwrap();
 
     let responses = lines(out);
     assert_eq!(responses.len(), 4);
@@ -155,6 +181,6 @@ impl io::Write for BrokenLog {
 #[test]
 fn a_failing_log_does_not_stop_the_receiver() {
     let mut out = Vec::new();
-    secure_sensor_link::run(session().as_slice(), &mut out, BrokenLog).unwrap();
+    secure_sensor_link::run(session().as_slice(), &mut out, BrokenLog, Diagnostics::All).unwrap();
     assert_eq!(lines(out).len(), 4);
 }
