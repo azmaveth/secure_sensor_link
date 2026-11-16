@@ -187,6 +187,38 @@ cargo clippy --all-targets
 cargo fmt --check
 ```
 
+## Fuzzing
+
+Four coverage-guided fuzz targets (libFuzzer) live in `fuzz/`, a package of
+its own so that the receiver's dependencies stay as the spec limits them.
+
+| Target | Input | What must hold |
+|---|---|---|
+| `frame` | arbitrary bytes, as a frame and as hex text | parsing never panics; an accepted frame has exactly the spec's layout |
+| `tree` | arbitrary bytes as a payload | decoding never panics; an accepted tree is within the limits and encodes back to exactly the input; a tree rejected as too large is over a limit |
+| `lines` | arbitrary bytes on stdin after a valid `init` | never panics; one response per line; every response is a well-formed response object |
+| `session` | a session of correctly signed frames, key commands and restarts, steered by the input | a frame is accepted only with the right key, an unrevoked and unretired key id, a valid payload and a seq above every seq ever accepted from that camera, restarts included; queues stay within `max_pending`; replay writes stay within the endurance budget |
+
+Run them all for 60 seconds each, or one for longer:
+
+```bash
+./fuzz/run.sh
+```
+
+```bash
+./fuzz/run.sh session 600
+```
+
+This needs only the stable toolchain and a C++ compiler. The script passes
+the coverage flags `cargo-fuzz` would, without a sanitizer: sanitizers need
+a nightly toolchain, and the receiver has no `unsafe` code. Overflow checks
+and debug assertions are on. A failing input is saved under
+`fuzz/artifacts/<target>/`; to replay one:
+
+```bash
+./fuzz/target/*/release/session fuzz/artifacts/session/crash-<hash>
+```
+
 ## Code layout
 
 | File | Role |
@@ -205,3 +237,4 @@ cargo fmt --check
 | `src/diagnostics.rs` | diagnostics profiles (`off`, `security`, `all`) and the `--diagnostics` argument |
 | `src/log_writer.rs` | writes events on a separate thread through a bounded queue, so an unread stderr can't stop the receiver |
 | `Dockerfile` | audit, toolchain, test, build and runtime stages, on images pinned by digest; `.dockerignore` sends the build only what it needs |
+| `fuzz/` | fuzz targets and `run.sh`, which builds and runs them |
