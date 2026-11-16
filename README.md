@@ -206,7 +206,7 @@ its own so that the receiver's dependencies stay as the spec limits them.
 | `lines` | arbitrary bytes on stdin after a valid `init` | never panics; one response per line; every response is a well-formed response object |
 | `session` | a session of correctly signed frames, key commands and restarts, steered by the input | a frame is accepted only with the right key, an unrevoked and unretired key id, a valid payload and a seq above every seq ever accepted from that camera, restarts included; queues stay within `max_pending`; replay writes stay within the endurance budget |
 
-Run them all for 60 seconds each, or one for longer:
+Run them all for 60 seconds each, one for longer, or all for longer:
 
 ```bash
 ./fuzz/run.sh
@@ -215,6 +215,16 @@ Run them all for 60 seconds each, or one for longer:
 ```bash
 ./fuzz/run.sh session 600
 ```
+
+```bash
+./fuzz/run.sh all 900
+```
+
+Each run starts from two sets of inputs. `fuzz/seeds/` is committed: the
+spec's example frames, payloads and commands, so a run begins past the tag
+check instead of at the first parse error. `fuzz/corpus/` is where libFuzzer
+keeps every input that reached new code; it is not committed, and a later
+run carries on from it.
 
 This needs only the stable toolchain and a C++ compiler. The script passes
 the coverage flags `cargo-fuzz` would, without a sanitizer: sanitizers need
@@ -234,7 +244,7 @@ and debug assertions are on. A failing input is saved under
 |---|---|
 | Format, lints and tests | the Docker `test` stage, then the runtime image on the spec's example session (one response per command, nothing on stderr) |
 | Dependency advisories | the Docker `audit` stage, against the advisory database as it is at that moment |
-| Fuzz targets | `./fuzz/run.sh`: each target for 60 seconds, keeping any failing input as a build artifact |
+| Fuzz targets | `./fuzz/run.sh`: each target for 60 seconds on a pull request or a push, and for 15 minutes on the weekly run. The corpus is carried from one run to the next, and any failing input is kept as a build artifact |
 
 The weekly run is there so that a new advisory, or a fuzz failure that takes
 longer to find, shows up without anyone pushing a change. Actions are pinned
@@ -258,5 +268,5 @@ by commit, as the Docker images are by digest.
 | `src/diagnostics.rs` | diagnostics profiles (`off`, `security`, `all`) and the `--diagnostics` argument |
 | `src/log_writer.rs` | writes events on a separate thread through two bounded queues, security events first, so an unread stderr can't stop the receiver |
 | `Dockerfile` | audit, toolchain, test, build and runtime stages, on images pinned by digest; `.dockerignore` sends the build only what it needs |
-| `fuzz/` | fuzz targets and `run.sh`, which builds and runs them |
+| `fuzz/` | fuzz targets, their seed inputs, and `run.sh`, which builds and runs them |
 | `.github/workflows/ci.yml` | tests, dependency audit and a short fuzz run on every pull request and weekly |

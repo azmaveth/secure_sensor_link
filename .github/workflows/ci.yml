@@ -60,7 +60,11 @@ jobs:
   fuzz:
     name: Fuzz targets
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 90
+    env:
+      # A minute per target on a pull request or a push, so the check stays
+      # quick; fifteen on the weekly run and when started by hand.
+      FUZZ_SECONDS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '900' || '60' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,10 +75,19 @@ jobs:
         run: |
           rustup toolchain install 1.99 --profile minimal --no-self-update
           rustup default 1.99
-      # A short run of each target: long enough to catch a regression in
-      # the parsers or the state machine, not a substitute for a long run.
-      - name: Fuzz each target for 60 seconds
-        run: ./fuzz/run.sh
+      # Each run starts from the inputs earlier runs found and saves what it
+      # adds, so coverage builds up over time instead of starting over. The
+      # key is unique per run, so the newest corpus is always the one
+      # restored. The committed seeds are read as well, whatever the cache
+      # holds.
+      - name: Restore the corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-
+      - name: Fuzz each target
+        run: ./fuzz/run.sh all "$FUZZ_SECONDS"
       - name: Keep crashing inputs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
