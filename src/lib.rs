@@ -13,12 +13,14 @@
 //! - [`nvs`]: the simulated non-volatile store that survives restarts.
 //! - [`response`]: response JSON shapes.
 //! - [`event`]: diagnostics for operators, written to stderr.
+//! - [`diagnostics`]: which of those events are written; none by default.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod camera;
 pub mod command;
+pub mod diagnostics;
 pub mod event;
 pub mod frame;
 pub mod line_reader;
@@ -31,15 +33,22 @@ pub mod tree;
 use std::io::{self, BufRead, Write};
 use std::panic::{self, AssertUnwindSafe};
 
+use diagnostics::Diagnostics;
 use line_reader::{BoundedLines, Line, MAX_LINE_LEN};
 use receiver::Receiver;
 use response::Response;
 
 /// Runs the receiver over `input` until end of input, writing one response
-/// line per input line to `output` and flushing after each. Diagnostic
-/// events go to `log`, one JSON line each. A failure to write the log is
-/// ignored: diagnostics must never stop the receiver.
-pub fn run<R: BufRead, W: Write, L: Write>(input: R, mut output: W, mut log: L) -> io::Result<()> {
+/// line per input line to `output` and flushing after each. The diagnostic
+/// events that `diagnostics` allows go to `log`, one JSON line each; with
+/// [`Diagnostics::Off`] `log` is never written. A failure to write the log
+/// is ignored: diagnostics must never stop the receiver.
+pub fn run<R: BufRead, W: Write, L: Write>(
+    input: R,
+    mut output: W,
+    mut log: L,
+    diagnostics: Diagnostics,
+) -> io::Result<()> {
     let mut lines = BoundedLines::new(input, MAX_LINE_LEN);
     let mut receiver = Receiver::new();
     while let Some(line) = lines.next_line()? {
@@ -53,10 +62,16 @@ pub fn run<R: BufRead, W: Write, L: Write>(input: R, mut output: W, mut log: L) 
         };
         writeln!(output, "{}", response.to_json())?;
         output.flush()?;
+        let mut wrote = false;
         for event in receiver.take_events() {
-            let _ = writeln!(log, "{}", event.to_json());
+            if diagnostics.allows(&event) {
+                let _ = writeln!(log, "{}", event.to_json());
+                wrote = true;
+            }
         }
-        let _ = log.flush();
+        if wrote {
+            let _ = log.flush();
+        }
     }
     Ok(())
 }

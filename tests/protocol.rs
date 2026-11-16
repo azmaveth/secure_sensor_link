@@ -4,6 +4,7 @@ mod common;
 
 use common::*;
 use secure_sensor_link::camera::Camera;
+use secure_sensor_link::diagnostics::Diagnostics;
 use serde_json::{Value, json};
 
 fn no_overrides() -> Value {
@@ -253,7 +254,8 @@ fn wide_window_pairs_greedily_with_the_oldest_candidate() {
 fn version_2_frames_use_their_key_id() {
     let mut rx = Rx::new(no_overrides());
     rx.accept(&frame(1, 1, 0).v2(0, cam1_key()));
-    assert_eq!(rx.reject(&frame(1, 2, 50).v2(3, key(0x99))), "cam1 key 3 is not provisioned");
+    // Key 3 isn't provisioned yet, so nothing can authenticate under it.
+    assert_eq!(rx.reject(&frame(1, 2, 50).v2(3, key(0x99))), "authentication failed for cam1");
     assert_eq!(rx.add_key("cam1", 3, key(0x99))["status"], "ok");
     let p = rx.accept(&frame(1, 2, 50).v2(3, key(0x99)));
     assert_eq!(p["frame"]["key_id"], 3);
@@ -288,6 +290,20 @@ fn key_status_is_reported_only_for_frames_made_with_that_key() {
     assert_eq!(rx.reject(&frame(1, 1, 0)), "cam1 key 0 is retired");
 
     assert_eq!(rx.state(), before);
+}
+
+#[test]
+fn a_forgery_cannot_tell_which_key_ids_are_provisioned() {
+    let mut rx = Rx::new(no_overrides());
+    rx.add_key("cam1", 3, key(0x40));
+    // Ids 0 and 3 exist, 7 and 255 don't. Without the key the answer is the same.
+    for key_id in [0, 3, 7, 255] {
+        assert_eq!(
+            rx.reject(&frame(1, 1, 0).v2(key_id, key(0x99))),
+            "authentication failed for cam1",
+            "key_id {key_id}"
+        );
+    }
 }
 
 #[test]
@@ -329,6 +345,27 @@ fn add_key_rejects_conflicting_revoked_and_stale_ids() {
         rx.state()["cameras"]["cam1"]["keys"],
         json!([{"key_id":0,"status":"retired"},{"key_id":5,"status":"active"}])
     );
+}
+
+#[test]
+fn a_revoked_key_cannot_be_provisioned_again_under_any_id_or_camera() {
+    let mut rx = Rx::new(no_overrides());
+    rx.revoke_key("cam1", 0);
+    let before = rx.state();
+    for (camera, key_id) in [("cam1", 1), ("cam1", 200), ("cam2", 1)] {
+        let response = rx.add_key(camera, key_id, cam1_key());
+        assert_eq!(
+            response["payload"]["message"],
+            "this key was revoked as cam1 key 0 and cannot be provisioned again",
+            "{camera} key {key_id}"
+        );
+    }
+    assert_eq!(rx.state(), before);
+
+    // So a frame made with the revoked key can't come back under a new id.
+    assert_eq!(rx.reject(&frame(1, 1, 0).v2(1, cam1_key())), "authentication failed for cam1");
+    // A key that was never revoked is still fine.
+    assert_eq!(rx.add_key("cam1", 1, key(0x40))["status"], "ok");
 }
 
 #[test]
@@ -437,7 +474,7 @@ fn replay_writes_stay_within_the_endurance_budget() {
 
 fn run_lines(input: &[u8]) -> Vec<Value> {
     let mut out = Vec::new();
-    secure_sensor_link::run(input, &mut out, std::io::sink()).unwrap();
+    secure_sensor_link::run(input, &mut out, std::io::sink(), Diagnostics::All).unwrap();
     String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
